@@ -1,20 +1,71 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/axigatelabs/axigate-finops/internal/ledger"
 )
 
-type capture struct{ events []ledger.Event }
+// TestForwardsLargeRequestBodyUnchanged guards the truncation fix: a request
+// body far above the old 1 MiB response-buffer cap must reach the upstream in
+// full, not silently cut.
+func TestForwardsLargeRequestBodyUnchanged(t *testing.T) {
+	var got int64
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = int64(len(b))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"gpt-4o","usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer up.Close()
+	gw := New(Config{Upstream: up.URL, Provider: "openai", Recorder: &capture{}, Now: fixedClock()})
+	front := httptest.NewServer(gw)
+	defer front.Close()
 
-func (c *capture) Record(e ledger.Event) { c.events = append(c.events, e) }
+	body := bytes.Repeat([]byte("a"), 3<<20) // 3 MiB, well over the old cap
+	resp, err := http.Post(front.URL+"/v1/chat/completions", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got != int64(len(body)) {
+		t.Fatalf("upstream received %d bytes, want the full %d — request body was truncated", got, len(body))
+	}
+}
+
+func TestParseMoneyRejectsNonFinite(t *testing.T) {
+	for _, s := range []string{"Inf", "Infinity", "+Inf", "inf", "NaN", "-5", "abc", "", "0", "  "} {
+		if v := parseMoney(s); v != 0 {
+			t.Fatalf("parseMoney(%q) = %v, want 0 (a bad value must never set a live cap)", s, v)
+		}
+	}
+	if v := parseMoney("5.00"); v != 5.0 {
+		t.Fatalf("parseMoney(5.00) = %v, want 5", v)
+	}
+	if v := parseMoney("$2.50"); v != 2.5 {
+		t.Fatalf("parseMoney($2.50) = %v, want 2.5", v)
+	}
+}
+
+type capture struct {
+	mu     sync.Mutex
+	events []ledger.Event
+}
+
+func (c *capture) Record(e ledger.Event) { c.mu.Lock(); c.events = append(c.events, e); c.mu.Unlock() }
+
+// count safely reports how many events have been recorded. record() runs in the
+// server goroutine after the response is relayed, so a streamed test must wait
+// for it rather than read the slice the instant the client's read returns.
+func (c *capture) count() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.events) }
 
 func fixedClock() func() time.Time {
 	t := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
