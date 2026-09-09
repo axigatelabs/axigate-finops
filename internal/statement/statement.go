@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/axigatelabs/axigate-finops/internal/csvsafe"
 	"github.com/axigatelabs/axigate-finops/internal/ledger"
 )
 
@@ -39,7 +40,10 @@ func WriteCSV(w io.Writer, events []ledger.Event) error {
 	}
 	for _, e := range rows {
 		rec := []string{
-			e.Period, e.Provider, e.Model, e.Tags.Team, e.Tags.Project, e.Tags.Customer, e.Tags.Agent,
+			// Guard caller/provider text (provider, model, tags) against
+			// spreadsheet formula injection; period/confidence/numbers are safe.
+			e.Period, csvsafe.Field(e.Provider), csvsafe.Field(e.Model),
+			csvsafe.Field(e.Tags.Team), csvsafe.Field(e.Tags.Project), csvsafe.Field(e.Tags.Customer), csvsafe.Field(e.Tags.Agent),
 			string(e.Confidence), strconv.FormatFloat(e.CostUSD, 'f', 6, 64),
 			strconv.FormatInt(e.Usage.InputTokens, 10), strconv.FormatInt(e.Usage.CacheRead, 10),
 			strconv.FormatInt(e.Usage.CacheWrite5m, 10), strconv.FormatInt(e.Usage.CacheWrite1h, 10),

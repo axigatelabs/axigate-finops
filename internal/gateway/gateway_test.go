@@ -67,6 +67,21 @@ func (c *capture) Record(e ledger.Event) { c.mu.Lock(); c.events = append(c.even
 // for it rather than read the slice the instant the client's read returns.
 func (c *capture) count() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.events) }
 
+// waitEvents blocks briefly until exactly n events have been recorded. record()
+// runs in the server goroutine after the response is relayed (and, for streamed
+// responses, after the client's read has already returned), so a test must wait
+// for it rather than read the slice the instant the client call returns.
+func (c *capture) waitEvents(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if c.count() == n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("events: %d, want %d", c.count(), n)
+}
+
 func fixedClock() func() time.Time {
 	t := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	return func() time.Time { return t }
@@ -178,9 +193,7 @@ func TestForwardsAnthropicUnchangedAndRecordsUsage(t *testing.T) {
 		t.Fatalf("request body not forwarded intact: %s", gotBody)
 	}
 
-	if len(rec.events) != 1 {
-		t.Fatalf("events: %d", len(rec.events))
-	}
+	rec.waitEvents(t, 1)
 	e := rec.events[0]
 	if e.Source != SourceGateway || e.Provider != "anthropic" || e.Model != "claude-sonnet-4-5" {
 		t.Fatalf("event id fields: %+v", e)
@@ -221,9 +234,7 @@ func TestForwardsOpenAIAndPricesInclusiveInput(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	if len(rec.events) != 1 {
-		t.Fatalf("events: %d", len(rec.events))
-	}
+	rec.waitEvents(t, 1)
 	e := rec.events[0]
 	// Model comes from the response (the dated snapshot), not the request's family name.
 	if e.Model != "gpt-4o-2024-08-06" {
@@ -274,9 +285,7 @@ func TestFailOpenWhenUsageCannotBeRead(t *testing.T) {
 	if !strings.Contains(string(body), "message_stop") {
 		t.Fatalf("stream not passed through: %s", body)
 	}
-	if len(rec.events) != 1 {
-		t.Fatalf("events: %d", len(rec.events))
-	}
+	rec.waitEvents(t, 1)
 	e := rec.events[0]
 	if e.Dimensions["stream"] != "true" || e.Dimensions["usage"] != "unknown" {
 		t.Fatalf("streamed event not marked: %+v", e.Dimensions)
@@ -338,9 +347,7 @@ func TestLoopDetectionAnnotatesTheEventReportOnly(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	if len(rec.events) != 5 {
-		t.Fatalf("events: %d", len(rec.events))
-	}
+	rec.waitEvents(t, 5)
 	// The third run-loop request crosses the threshold; the first two do not.
 	if rec.events[0].Dimensions["loop"] != "" || rec.events[1].Dimensions["loop"] != "" {
 		t.Fatalf("flagged too early: %+v %+v", rec.events[0].Dimensions, rec.events[1].Dimensions)
@@ -455,9 +462,7 @@ func TestEachRequestGetsADistinctId(t *testing.T) {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
-	if len(rec.events) != 3 {
-		t.Fatalf("events: %d", len(rec.events))
-	}
+	rec.waitEvents(t, 3)
 	ids := map[string]bool{}
 	for _, e := range rec.events {
 		if ids[e.ID] {

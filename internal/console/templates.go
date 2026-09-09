@@ -12,7 +12,7 @@ const baseCSS = `
   --line:#242b39; --line-2:#2f3749;
   --ink:#eef1f6; --ink-2:#9aa4b6; --ink-3:#616b7d;
   --money:#3ddc84; --money-dim:#1c7a49;
-  --pro:#8b93ff; --danger:#ff6b6b;
+  --pro:#8b93ff; --danger:#ff6b6b; --partial:#f5a623;
   --sans:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
   --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
   --sh:0 1px 0 rgba(255,255,255,.02) inset,0 1px 2px rgba(0,0,0,.4),0 10px 30px -16px rgba(0,0,0,.7);

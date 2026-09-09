@@ -71,9 +71,29 @@ func TestZeroCacheBucketsMatchPlainPricing(t *testing.T) {
 }
 
 func TestFullPriceEquivalentCountsEveryInputToken(t *testing.T) {
-	got := FullPriceEquivalent("claude-sonnet-4-5", Usage{InputTokens: 1000, CacheRead: 5000, CacheWrite5m: 2000, OutputTokens: 500})
+	// anthropic is exclusive: InputTokens is the uncached figure, so the full
+	// no-cache count is the uncached input plus every cached token.
+	got := FullPriceEquivalent("anthropic", "claude-sonnet-4-5", Usage{InputTokens: 1000, CacheRead: 5000, CacheWrite5m: 2000, OutputTokens: 500})
 	if !close(got, 8000*0.000003) {
 		t.Fatalf("full price: got %.9f", got)
+	}
+}
+
+func TestFullPriceEquivalentDoesNotDoubleCountInclusiveCache(t *testing.T) {
+	// openai/gemini are inclusive: InputTokens already includes cached tokens,
+	// so the full no-cache baseline is InputTokens alone — cached tokens must
+	// NOT be re-added (that overstated the "reads saved" figure).
+	u := Usage{InputTokens: 1000, CacheRead: 800}
+	rate := Rates["gpt-4o"].InputPerToken
+	got := FullPriceEquivalent("openai", "gpt-4o", u)
+	if !close(got, 1000*rate) {
+		t.Fatalf("inclusive full price should be InputTokens*rate=%.9f, got %.9f (cached tokens double-counted?)", 1000*rate, got)
+	}
+	// The honest savings (full - priced) must be positive but never exceed the
+	// full baseline — the old double-count made it larger than full itself.
+	saved := got - Price("openai", "gpt-4o", u).USD
+	if saved <= 0 || saved >= got {
+		t.Fatalf("savings should be positive and below the full baseline %.9f, got %.9f", got, saved)
 	}
 }
 
@@ -117,7 +137,7 @@ func TestDatedSnapshotsResolveToTheirFamilyAndNothingElseIsGuessed(t *testing.T)
 			t.Errorf("%q must stay unlisted, got %q", model, key)
 		}
 	}
-	if got := FullPriceEquivalent("gpt-4o-mini-2024-07-18", Usage{InputTokens: 1_000_000}); !close(got, 0.15) {
+	if got := FullPriceEquivalent("openai", "gpt-4o-mini-2024-07-18", Usage{InputTokens: 1_000_000}); !close(got, 0.15) {
 		t.Fatalf("full price of a snapshot: %.4f", got)
 	}
 }

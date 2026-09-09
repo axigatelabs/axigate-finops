@@ -13,10 +13,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/axigatelabs/axigate-finops/internal/focus"
@@ -31,10 +33,34 @@ type Server struct {
 	latest   time.Time
 	mux      *http.ServeMux
 
-	// ledgerPath, when set, makes the console re-read this JSONL ledger on every
-	// request, so a dashboard refresh reflects events the gateway has appended
-	// since boot. Empty = serve the fixed events from New.
-	ledgerPath string
+	// ledgerPath, when set, makes the console re-read this JSONL ledger, so a
+	// dashboard refresh reflects events the gateway has appended since boot.
+	// Empty = serve the fixed events from New. The parse is memoized on the
+	// file's size+mtime so an unchanged ledger is not re-parsed on every request.
+	ledgerPath   string
+	ledgerMu     sync.Mutex
+	ledgerCache  []ledger.Event
+	ledgerBounds [2]time.Time
+	ledgerKey    string
+}
+
+// liveLedger returns the ledger and its time bounds, re-reading and re-parsing
+// the file only when it has changed (keyed on size+mtime), so a dashboard
+// refresh is cheap instead of O(history) on every request.
+func (s *Server) liveLedger() ([]ledger.Event, time.Time, time.Time) {
+	fi, err := os.Stat(s.ledgerPath)
+	if err != nil {
+		return nil, time.Time{}, time.Time{}
+	}
+	key := fmt.Sprintf("%d:%d", fi.Size(), fi.ModTime().UnixNano())
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+	if key != s.ledgerKey || s.ledgerCache == nil {
+		evs := readLedgerFile(s.ledgerPath)
+		e, l := boundsOf(evs)
+		s.ledgerCache, s.ledgerBounds, s.ledgerKey = evs, [2]time.Time{e, l}, key
+	}
+	return s.ledgerCache, s.ledgerBounds[0], s.ledgerBounds[1]
 }
 
 // New builds a server over events. Pass a nil slice with SetLedgerFile to serve
@@ -116,8 +142,7 @@ type scope struct {
 
 func (s *Server) scopeFor() scope {
 	if s.ledgerPath != "" {
-		evs := readLedgerFile(s.ledgerPath)
-		e, l := boundsOf(evs)
+		evs, e, l := s.liveLedger()
 		return scope{evs: evs, earliest: e, latest: l}
 	}
 	return scope{evs: s.events, earliest: s.earliest, latest: s.latest}
@@ -129,7 +154,18 @@ func windowOf(sc scope, reqDays int) (from time.Time, days int) {
 	if days <= 0 {
 		return sc.earliest, 0
 	}
-	return sc.latest.Add(-time.Duration(days) * 24 * time.Hour), days
+	// Cap the arithmetic so a huge ?days value can't overflow time.Duration (in
+	// ns) and wrap to a future instant that excludes every event; never return a
+	// window that predates the ledger.
+	d := days
+	if d > 36600 {
+		d = 36600
+	}
+	from = sc.latest.Add(-time.Duration(d) * 24 * time.Hour)
+	if from.Before(sc.earliest) {
+		from = sc.earliest
+	}
+	return from, days
 }
 
 func inWindowOf(sc scope, from time.Time) []ledger.Event {

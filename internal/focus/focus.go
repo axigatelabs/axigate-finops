@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/axigatelabs/axigate-finops/internal/csvsafe"
 	"github.com/axigatelabs/axigate-finops/internal/ledger"
 	"github.com/axigatelabs/axigate-finops/internal/report"
 )
@@ -58,9 +59,12 @@ func Row(e ledger.Event, account string) map[string]string {
 	if resource == "" {
 		resource = dim("workspace_id")
 	}
+	// Caller- and provider-supplied text (tags, model, provider, description) is
+	// guarded against spreadsheet formula injection; fixed literals, dates and
+	// numbers are written as-is (never guard a numeric column).
 	return map[string]string{
-		"BillingAccountId":   account,
-		"BillingAccountName": account,
+		"BillingAccountId":   csvsafe.Field(account),
+		"BillingAccountName": csvsafe.Field(account),
 		"ChargePeriodStart":  e.StartsAt.UTC().Format("2006-01-02T15:04:05Z"),
 		"ChargePeriodEnd":    e.EndsAt.UTC().Format("2006-01-02T15:04:05Z"),
 		"BillingPeriodStart": e.Period,
@@ -68,25 +72,25 @@ func Row(e ledger.Event, account string) map[string]string {
 		"EffectiveCost":      cost,
 		"ListCost":           cost,
 		"BillingCurrency":    "USD",
-		"ProviderName":       e.Provider,
-		"PublisherName":      e.Provider,
-		"InvoiceIssuerName":  e.Provider,
-		"ServiceName":        serviceName(e.Provider),
+		"ProviderName":       csvsafe.Field(e.Provider),
+		"PublisherName":      csvsafe.Field(e.Provider),
+		"InvoiceIssuerName":  csvsafe.Field(e.Provider),
+		"ServiceName":        csvsafe.Field(serviceName(e.Provider)),
 		"ServiceCategory":    "AI and Machine Learning",
 		"ChargeCategory":     "Usage",
-		"ChargeDescription":  chargeDescription(e),
-		"SkuId":              e.Model,
-		"ResourceId":         resource,
+		"ChargeDescription":  csvsafe.Field(chargeDescription(e)),
+		"SkuId":              csvsafe.Field(e.Model),
+		"ResourceId":         csvsafe.Field(resource),
 		"ConsumedQuantity":   strconv.FormatInt(consumedTokens(e.Usage), 10),
 		"ConsumedUnit":       "Tokens",
-		"x_Team":             e.Tags.Team,
-		"x_Project":          e.Tags.Project,
-		"x_Customer":         e.Tags.Customer,
-		"x_Agent":            e.Tags.Agent,
-		"x_Run":              e.Tags.Run,
+		"x_Team":             csvsafe.Field(e.Tags.Team),
+		"x_Project":          csvsafe.Field(e.Tags.Project),
+		"x_Customer":         csvsafe.Field(e.Tags.Customer),
+		"x_Agent":            csvsafe.Field(e.Tags.Agent),
+		"x_Run":              csvsafe.Field(e.Tags.Run),
 		"x_Confidence":       string(e.Confidence),
-		"x_Source":           e.Source,
-		"x_PriceVersion":     e.PriceVersion,
+		"x_Source":           csvsafe.Field(e.Source),
+		"x_PriceVersion":     csvsafe.Field(e.PriceVersion),
 	}
 }
 
