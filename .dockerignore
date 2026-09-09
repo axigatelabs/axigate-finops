@@ -1,0 +1,13 @@
+# keep the build context tiny and free of local data
+.git
+/axigate-finops
+/axigate-finops.exe
+/reports/
+/data/
+*.csv
+*.jsonl
+*.test
+*.out
+adrs/
+docs/
+README.md

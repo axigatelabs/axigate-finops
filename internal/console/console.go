@@ -1,0 +1,349 @@
+// Package console is the local dashboard's read side: an HTTP API and a
+// dark-mode dashboard over the gateway's ledger. The money math is not
+// reimplemented here; totals and inclusion come from internal/report and the
+// FOCUS export from internal/focus, so the dashboard and the exports can never
+// disagree with the statement.
+//
+// It is self-hosted and unrestricted: full history and every export, no tiers
+// and no account. Point it at a ledger file and it re-reads it on each request,
+// so a refresh reflects whatever the gateway has appended.
+package console
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/axigatelabs/axigate-finops/internal/focus"
+	"github.com/axigatelabs/axigate-finops/internal/ledger"
+	"github.com/axigatelabs/axigate-finops/internal/report"
+)
+
+// Server serves the console over a set of events, or live from a ledger file.
+type Server struct {
+	events   []ledger.Event
+	earliest time.Time
+	latest   time.Time
+	mux      *http.ServeMux
+
+	// ledgerPath, when set, makes the console re-read this JSONL ledger on every
+	// request, so a dashboard refresh reflects events the gateway has appended
+	// since boot. Empty = serve the fixed events from New.
+	ledgerPath string
+}
+
+// New builds a server over events. Pass a nil slice with SetLedgerFile to serve
+// a ledger file live instead.
+func New(events []ledger.Event) *Server {
+	s := &Server{events: events}
+	s.earliest, s.latest = boundsOf(events)
+	s.mux = http.NewServeMux()
+	s.mux.HandleFunc("/", s.handleDashboard)
+	s.mux.HandleFunc("/api/summary", s.handleSummary)
+	s.mux.HandleFunc("/api/export/focus", s.handleFocus)
+	s.mux.HandleFunc("/api/export/statement", s.handleStatement)
+	s.mux.HandleFunc("/api/export/json", s.handleJSON)
+	s.mux.HandleFunc("/run/", s.handleRun)
+	return s
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+
+// SetLedgerFile makes the console read this JSONL ledger live, on every request,
+// so a dashboard refresh reflects events the gateway has appended since the
+// console started. Without it the console serves the fixed events passed to New.
+func (s *Server) SetLedgerFile(path string) { s.ledgerPath = path }
+
+// readLedgerFile reads a JSONL ledger from disk for live serving, deduped by id.
+// It is tolerant on purpose: a blank or unparseable line — for instance a final
+// line the gateway is still in the middle of appending — is skipped rather than
+// failing the whole read, so a dashboard refresh during a write shows the events
+// written so far instead of an error.
+func readLedgerFile(path string) []ledger.Event {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	seen := map[string]bool{}
+	var out []ledger.Event
+	for sc.Scan() {
+		b := bytes.TrimSpace(sc.Bytes())
+		if len(b) == 0 {
+			continue
+		}
+		var e ledger.Event
+		if json.Unmarshal(b, &e) != nil {
+			continue
+		}
+		if e.Validate() != nil {
+			continue
+		}
+		if !seen[e.ID] {
+			seen[e.ID] = true
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func boundsOf(evs []ledger.Event) (earliest, latest time.Time) {
+	for _, e := range evs {
+		if earliest.IsZero() || e.StartsAt.Before(earliest) {
+			earliest = e.StartsAt
+		}
+		if e.StartsAt.After(latest) {
+			latest = e.StartsAt
+		}
+	}
+	return
+}
+
+// scope is the request's view of the ledger: the events it may see and their
+// time bounds. Live when a ledger file is set, otherwise the fixed events.
+type scope struct {
+	evs      []ledger.Event
+	earliest time.Time
+	latest   time.Time
+}
+
+func (s *Server) scopeFor() scope {
+	if s.ledgerPath != "" {
+		evs := readLedgerFile(s.ledgerPath)
+		e, l := boundsOf(evs)
+		return scope{evs: evs, earliest: e, latest: l}
+	}
+	return scope{evs: s.events, earliest: s.earliest, latest: s.latest}
+}
+
+// windowOf resolves a requested day count. Days <= 0 means "all time".
+func windowOf(sc scope, reqDays int) (from time.Time, days int) {
+	days = reqDays
+	if days <= 0 {
+		return sc.earliest, 0
+	}
+	return sc.latest.Add(-time.Duration(days) * 24 * time.Hour), days
+}
+
+func inWindowOf(sc scope, from time.Time) []ledger.Event {
+	if from.IsZero() || !from.After(sc.earliest) {
+		return sc.evs
+	}
+	out := make([]ledger.Event, 0, len(sc.evs))
+	for _, e := range sc.evs {
+		if !e.StartsAt.Before(from) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Line is one labelled dollar figure for the API.
+type Line struct {
+	Key string  `json:"key"`
+	USD float64 `json:"usd"`
+}
+
+// DayPoint is one day's spend, for the spend-over-time chart.
+type DayPoint struct {
+	Day string  `json:"day"`
+	USD float64 `json:"usd"`
+}
+
+// BlockedRun is a run the gateway refused calls for. AvoidedUSD estimates what
+// the blocked calls would have cost had they run, from this run's own average
+// successful call, so the value of the block is legible, not just a count.
+type BlockedRun struct {
+	Run        string  `json:"run"`
+	Agent      string  `json:"agent"`
+	Model      string  `json:"model"`
+	Blocked    int     `json:"blocked"`
+	AvoidedUSD float64 `json:"avoided_usd"`
+}
+
+// Summary is the dashboard payload.
+type Summary struct {
+	Days         int          `json:"days"` // 0 = all time
+	RangeStart   string       `json:"range_start"`
+	RangeEnd     string       `json:"range_end"`
+	Events       int          `json:"events"`
+	TotalUSD     float64      `json:"total_usd"`
+	ByProvider   []Line       `json:"by_provider"`
+	ByTeam       []Line       `json:"by_team"`
+	ByAgent      []Line       `json:"by_agent"`
+	ByModel      []Line       `json:"by_model"`
+	LoopsBlocked int          `json:"loops_blocked"`
+	BlockedRuns  []BlockedRun `json:"blocked_runs"`
+	Daily        []DayPoint   `json:"daily"`
+	PeakDayUSD   float64      `json:"peak_day_usd"`
+	AvoidedUSD   float64      `json:"avoided_usd"`
+}
+
+func linesOf(m map[string]float64) []Line {
+	out := make([]Line, 0, len(m))
+	for k, v := range m {
+		out = append(out, Line{Key: k, USD: v})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].USD != out[j].USD {
+			return out[i].USD > out[j].USD
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func summaryOf(sc scope, reqDays int) Summary {
+	from, days := windowOf(sc, reqDays)
+	evs := inWindowOf(sc, from)
+	r := report.Build(evs)
+
+	byTeam, byAgent := map[string]float64{}, map[string]float64{}
+	byRun := map[string]int{}
+	blocked := 0
+	for _, e := range report.Included(evs) {
+		if t := e.Tags.Team; t != "" {
+			byTeam[t] += e.CostUSD
+		} else {
+			byTeam["(untagged)"] += e.CostUSD
+		}
+		if a := e.Tags.Agent; a != "" {
+			byAgent[a] += e.CostUSD
+		} else {
+			byAgent["(untagged)"] += e.CostUSD
+		}
+	}
+	// Per run: how much it actually spent on successful calls, and how many
+	// calls were refused. The average successful call estimates what each
+	// refused call would have cost.
+	sumByRun, cntByRun := map[string]float64{}, map[string]int{}
+	agentByRun, modelByRun := map[string]string{}, map[string]string{}
+	var globalSum float64
+	var globalCnt int
+	for _, e := range evs {
+		if e.Dimensions["blocked"] != "" {
+			blocked++
+			byRun[e.Tags.Run]++
+			if agentByRun[e.Tags.Run] == "" {
+				agentByRun[e.Tags.Run] = e.Tags.Agent
+			}
+			if modelByRun[e.Tags.Run] == "" {
+				modelByRun[e.Tags.Run] = e.Model
+			}
+			continue
+		}
+		if e.CostUSD > 0 {
+			sumByRun[e.Tags.Run] += e.CostUSD
+			cntByRun[e.Tags.Run]++
+			if modelByRun[e.Tags.Run] == "" {
+				modelByRun[e.Tags.Run] = e.Model
+			}
+			if agentByRun[e.Tags.Run] == "" {
+				agentByRun[e.Tags.Run] = e.Tags.Agent
+			}
+			globalSum += e.CostUSD
+			globalCnt++
+		}
+	}
+	avgCall := func(run string) float64 {
+		if cntByRun[run] > 0 {
+			return sumByRun[run] / float64(cntByRun[run])
+		}
+		if globalCnt > 0 {
+			return globalSum / float64(globalCnt)
+		}
+		return 0
+	}
+	runs := make([]BlockedRun, 0, len(byRun))
+	var avoidedTotal float64
+	for run, n := range byRun {
+		av := avgCall(run) * float64(n)
+		avoidedTotal += av
+		runs = append(runs, BlockedRun{Run: run, Agent: agentByRun[run], Model: modelByRun[run], Blocked: n, AvoidedUSD: av})
+	}
+	sort.Slice(runs, func(i, j int) bool {
+		if runs[i].AvoidedUSD != runs[j].AvoidedUSD {
+			return runs[i].AvoidedUSD > runs[j].AvoidedUSD
+		}
+		return runs[i].Blocked > runs[j].Blocked
+	})
+
+	byDay := map[string]float64{}
+	for _, e := range report.Included(evs) {
+		byDay[e.StartsAt.UTC().Format("2006-01-02")] += e.CostUSD
+	}
+	dayKeys := make([]string, 0, len(byDay))
+	for d := range byDay {
+		dayKeys = append(dayKeys, d)
+	}
+	sort.Strings(dayKeys)
+	daily := make([]DayPoint, 0, len(dayKeys))
+	var peak float64
+	for _, d := range dayKeys {
+		daily = append(daily, DayPoint{Day: d, USD: byDay[d]})
+		if byDay[d] > peak {
+			peak = byDay[d]
+		}
+	}
+	prov := map[string]float64{}
+	model := map[string]float64{}
+	for _, l := range r.ByProvider {
+		prov[l.Key] = l.USD
+	}
+	for _, l := range r.ByModel {
+		model[l.Key] = l.USD
+	}
+	start := sc.earliest
+	if !from.IsZero() && from.After(sc.earliest) {
+		start = from
+	}
+	return Summary{
+		Days:       days,
+		RangeStart: start.UTC().Format("2006-01-02"), RangeEnd: sc.latest.UTC().Format("2006-01-02"),
+		Events: len(evs), TotalUSD: r.TotalUSD,
+		ByProvider: linesOf(prov), ByTeam: linesOf(byTeam), ByAgent: linesOf(byAgent), ByModel: linesOf(model),
+		LoopsBlocked: blocked, BlockedRuns: runs,
+		Daily: daily, PeakDayUSD: peak, AvoidedUSD: avoidedTotal,
+	}
+}
+
+func reqDays(r *http.Request) int {
+	switch r.URL.Query().Get("days") {
+	case "", "all":
+		return 0
+	default:
+		n, _ := strconv.Atoi(r.URL.Query().Get("days"))
+		return n
+	}
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, summaryOf(s.scopeFor(), reqDays(r)))
+}
+
+func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
+	sc := s.scopeFor()
+	from, _ := windowOf(sc, reqDays(r))
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", "attachment; filename=axigate-focus.csv")
+	_ = focus.WriteCSV(w, inWindowOf(sc, from), "axigate")
+}
+
+func (s *Server) handleJSON(w http.ResponseWriter, r *http.Request) {
+	sc := s.scopeFor()
+	from, _ := windowOf(sc, reqDays(r))
+	writeJSON(w, http.StatusOK, report.Included(inWindowOf(sc, from)))
+}

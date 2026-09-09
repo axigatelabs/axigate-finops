@@ -1,0 +1,473 @@
+// Command axigate-finops is the local CLI: it reads provider reports on the
+// user's machine and writes the diagnostic and the statement next to them.
+// Nothing is uploaded. `fetch` pulls the reports from a provider's admin API
+// into local files first, so what `analyze` reads is always inspectable.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/axigatelabs/axigate-finops/internal/console"
+	"github.com/axigatelabs/axigate-finops/internal/fetch"
+	"github.com/axigatelabs/axigate-finops/internal/focus"
+	"github.com/axigatelabs/axigate-finops/internal/gateway"
+	"github.com/axigatelabs/axigate-finops/internal/importers/anyfile"
+	"github.com/axigatelabs/axigate-finops/internal/ledger"
+	"github.com/axigatelabs/axigate-finops/internal/owners"
+	"github.com/axigatelabs/axigate-finops/internal/report"
+	"github.com/axigatelabs/axigate-finops/internal/seed"
+	"github.com/axigatelabs/axigate-finops/internal/statement"
+)
+
+const usage = `axigate-finops — AI FinOps for agentic workloads
+
+Usage:
+  axigate-finops analyze <report.json>... [--owners owners.csv] [--out DIR]
+  axigate-finops fetch openai    --since YYYY-MM-DD [--until YYYY-MM-DD] --out DIR   (OPENAI_ADMIN_KEY)
+  axigate-finops fetch anthropic --since YYYY-MM-DD [--until YYYY-MM-DD] --out DIR   (ANTHROPIC_ADMIN_KEY)
+  axigate-finops gateway --provider openai|anthropic --upstream URL [--listen ADDR] [--ledger FILE]
+  axigate-finops serve [--provider openai|anthropic] [--gateway-listen ADDR] [--console-listen ADDR] [--ledger FILE]
+  axigate-finops seed --out FILE [--events N] [--seed N]
+  axigate-finops console --ledger FILE [--listen ADDR]
+
+analyze reads saved provider reports (OpenAI usage/costs pages, Anthropic
+usage/cost reports, the Anthropic Console cost CSV export, or the gateway's
+own JSONL ledger, in any order), maps ids to owners from a CSV, and writes
+report.txt and statement.csv into --out (default: the current directory).
+Gateway events already carry per-agent and per-run tags. Everything stays on
+this machine.
+
+fetch calls the provider's admin API with a read-only admin key from the
+environment and saves every page as JSON into --out, so you can see exactly
+what was read before analyze reads it. Nothing else is sent anywhere.
+
+console serves a dark-mode dashboard and a JSON/FOCUS/statement API over a
+gateway JSONL ledger — full history and every export, nothing gated. It
+re-reads the ledger on each request, so a refresh shows new events. Point a
+browser at the listen address.
+
+seed writes N synthetic gateway events (default 10000) to a JSONL file, across
+several teams and agents with one runaway loop, for building and testing the
+console without real keys or traffic. The data is invented and says so.
+
+gateway runs a self-hosted pass-through in front of one provider: point your
+app's base URL at it, keep using your normal key, and every call is forwarded
+unchanged while one metadata-only ledger event per request is appended to
+--ledger (default: ./gateway-events.jsonl). It reads token counts and your
+X-AxiGate-Team/Project/Customer/Agent/Run headers, and honors an inline
+X-AxiGate-Max-Spend header as a per-run spend cap set from your code; it never
+records prompts or answers and never alters the response. Read the ledger later
+with analyze.
+
+serve runs the gateway and the live dashboard together from this one binary, the
+whole product in one command: the gateway on --gateway-listen (default
+0.0.0.0:8080) and the dashboard on --console-listen (default 0.0.0.0:8906),
+sharing one --ledger file so spend appears in the dashboard the moment a call
+lands. This is what the Docker image runs by default.
+`
+
+func main() {
+	if len(os.Args) < 2 || os.Args[1] == "--help" || os.Args[1] == "-h" {
+		fmt.Fprint(os.Stdout, usage)
+		return
+	}
+	var err error
+	switch os.Args[1] {
+	case "analyze":
+		err = analyze(os.Args[2:])
+	case "fetch":
+		err = doFetch(os.Args[2:])
+	case "gateway":
+		err = doGateway(os.Args[2:])
+	case "serve":
+		err = doServe(os.Args[2:])
+	case "seed":
+		err = doSeed(os.Args[2:])
+	case "console":
+		err = doConsole(os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "axigate-finops: unknown command %q\n\n%s", os.Args[1], usage)
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "axigate-finops: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func analyze(args []string) error {
+	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
+	ownersPath := fs.String("owners", "", "CSV mapping provider ids to team/project/customer/agent")
+	out := fs.String("out", ".", "directory for report.txt and statement.csv")
+	focusPath := fs.String("focus", "", "also write a FOCUS-format export to this file")
+	var files []string
+	// Accept flags before or after the file list.
+	rest := []string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			rest = append(rest, a)
+			if !strings.Contains(a, "=") && i+1 < len(args) {
+				rest = append(rest, args[i+1])
+				i++
+			}
+			continue
+		}
+		files = append(files, a)
+	}
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("analyze needs at least one report file")
+	}
+	m := owners.Empty()
+	if *ownersPath != "" {
+		f, err := os.Open(*ownersPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if m, err = owners.Load(f); err != nil {
+			return err
+		}
+	}
+	var events []ledger.Event
+	kinds := map[anyfile.Kind]int{}
+	for _, path := range files {
+		evs, kind, err := anyfile.Parse(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		kinds[kind]++
+		events = append(events, evs...)
+	}
+	// Idempotence: the same row from two overlapping pages is one row.
+	seen := map[string]bool{}
+	deduped := events[:0]
+	for _, e := range events {
+		if seen[e.ID] {
+			continue
+		}
+		seen[e.ID] = true
+		deduped = append(deduped, e)
+	}
+	events = deduped
+	unknown := m.Apply(events)
+
+	r := report.Build(events)
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		return err
+	}
+	text := report.Text(r)
+	if err := os.WriteFile(filepath.Join(*out, "report.txt"), []byte(text), 0o644); err != nil {
+		return err
+	}
+	sf, err := os.Create(filepath.Join(*out, "statement.csv"))
+	if err != nil {
+		return err
+	}
+	if err := statement.WriteCSV(sf, events); err != nil {
+		sf.Close()
+		return err
+	}
+	sf.Close()
+	if *focusPath != "" {
+		ff, err := os.Create(*focusPath)
+		if err != nil {
+			return err
+		}
+		if err := focus.WriteCSV(ff, events, "axigate"); err != nil {
+			ff.Close()
+			return err
+		}
+		ff.Close()
+	}
+	fmt.Print(text)
+	var kindList []string
+	for k, n := range kinds {
+		kindList = append(kindList, fmt.Sprintf("%s×%d", k, n))
+	}
+	sort.Strings(kindList)
+	fmt.Printf("\n  Read %d files (%s) → %d ledger rows, %d without an owner (mapping: %d rows).\n", len(files), strings.Join(kindList, ", "), len(events), unknown, m.Len())
+	fmt.Printf("  Written: %s, %s\n", filepath.Join(*out, "report.txt"), filepath.Join(*out, "statement.csv"))
+	return nil
+}
+
+func doFetch(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("fetch needs a provider: openai or anthropic")
+	}
+	provider := args[0]
+	fs := flag.NewFlagSet("fetch", flag.ContinueOnError)
+	since := fs.String("since", "", "first day to include, YYYY-MM-DD (UTC)")
+	until := fs.String("until", "", "day to stop before, YYYY-MM-DD (UTC); default: today")
+	out := fs.String("out", ".", "directory to save the pages into")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *since == "" {
+		return fmt.Errorf("fetch needs --since YYYY-MM-DD")
+	}
+	var files []string
+	var err error
+	switch provider {
+	case "openai":
+		key := os.Getenv("OPENAI_ADMIN_KEY")
+		if key == "" {
+			return fmt.Errorf("OPENAI_ADMIN_KEY is not set: an Admin API key from platform.openai.com → Settings → Organization → Admin keys (Owner role), not a project key")
+		}
+		if w := fetch.KeyShapeWarning("openai", key); w != "" {
+			fmt.Fprintln(os.Stderr, "warning: "+w)
+		}
+		files, err = fetch.OpenAI(key, *since, *until, *out)
+	case "anthropic":
+		key := os.Getenv("ANTHROPIC_ADMIN_KEY")
+		if key == "" {
+			return fmt.Errorf("ANTHROPIC_ADMIN_KEY is not set: an Admin API key (sk-ant-admin…) or a key created with Scope: Organization at platform.claude.com → Organization settings → API keys; a workspace key cannot read reports")
+		}
+		if w := fetch.KeyShapeWarning("anthropic", key); w != "" {
+			fmt.Fprintln(os.Stderr, "warning: "+w)
+		}
+		if os.Getenv("ANTHROPIC_WORKSPACE_ID") != "" {
+			fmt.Fprintln(os.Stderr, "note: ANTHROPIC_WORKSPACE_ID is ignored; the usage and cost reports are Admin API endpoints and reject a workspace header. Unset it if a request is refused for that reason.")
+		}
+		files, err = fetch.Anthropic(key, *since, *until, *out)
+	default:
+		return fmt.Errorf("unknown provider %q: openai or anthropic", provider)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("saved %d page(s) into %s:\n", len(files), *out)
+	for _, f := range files {
+		fmt.Println("  " + f)
+	}
+	fmt.Println("next: axigate-finops analyze " + filepath.Join(*out, "*.json") + " --owners owners.csv")
+	return nil
+}
+
+func doGateway(args []string) error {
+	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
+	provider := fs.String("provider", "", "openai or anthropic (usage extraction and pricing)")
+	upstream := fs.String("upstream", "", "provider base URL; default: the provider's own")
+	listen := fs.String("listen", "127.0.0.1:8787", "address to listen on")
+	ledgerPath := fs.String("ledger", "gateway-events.jsonl", "file to append metadata-only events to")
+	loopWindow := fs.Duration("loop-window", time.Minute, "window for loop detection")
+	loopMaxReq := fs.Int("loop-max-requests", 0, "requests per run within the window that flag a loop (0 = off)")
+	loopMaxRep := fs.Int("loop-max-repeats", 0, "identical requests per run within the window that flag a loop (0 = off)")
+	maxCalls := fs.Int("max-calls-per-run", 0, "pause a run after this many calls (0 = off)")
+	maxSpend := fs.Float64("max-spend-per-run", 0, "pause a run after this many USD of estimated spend (0 = off)")
+	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
+	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints (empty = no bypass, no admin)")
+	requestCaps := fs.Bool("request-caps", true, "honor a caller's X-AxiGate-Max-Spend header as a per-run spend cap set from code")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	base := *upstream
+	switch *provider {
+	case "openai":
+		if base == "" {
+			base = "https://api.openai.com"
+		}
+	case "anthropic":
+		if base == "" {
+			base = "https://api.anthropic.com"
+		}
+	default:
+		return fmt.Errorf("gateway needs --provider openai or anthropic")
+	}
+	f, err := os.OpenFile(*ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gw := gateway.New(gateway.Config{
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f),
+		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
+	})
+
+	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errc := make(chan error, 1)
+	go func() { errc <- srv.ListenAndServe() }()
+	loopMsg := "off"
+	if *loopMaxReq > 0 || *loopMaxRep > 0 {
+		loopMsg = fmt.Sprintf("on (window %s, max %d/run, max %d identical)", *loopWindow, *loopMaxReq, *loopMaxRep)
+	}
+	ctrlMsg := "off"
+	if *maxCalls > 0 || *maxSpend > 0 || *pauseOnLoop {
+		ctrlMsg = fmt.Sprintf("on (max %d calls/run, max $%.2f/run, pause-on-loop=%v)", *maxCalls, *maxSpend, *pauseOnLoop)
+		if *adminToken == "" {
+			ctrlMsg += " — no admin token: a paused run needs a restart to clear"
+		}
+	}
+	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  point your app's base URL at http://%s and keep your normal key\n",
+		*listen, base, *provider, *ledgerPath, loopMsg, ctrlMsg, *listen)
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		fmt.Fprintln(os.Stderr, "\naxigate-finops gateway: shutting down")
+		return srv.Shutdown(shutCtx)
+	}
+}
+
+// doServe runs the gateway and the live dashboard together in one process, over
+// one shared ledger. It is the zero-friction path: one command, two ports, the
+// dashboard reflecting the gateway's traffic live. It is what the Docker image
+// runs by default.
+func doServe(args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	provider := fs.String("provider", "openai", "openai or anthropic (usage extraction and pricing)")
+	upstream := fs.String("upstream", "", "provider base URL; default: the provider's own")
+	gwListen := fs.String("gateway-listen", "0.0.0.0:8080", "address for the gateway; point your app's base URL here")
+	consoleListen := fs.String("console-listen", "0.0.0.0:8906", "address for the dashboard; open it in a browser")
+	ledgerPath := fs.String("ledger", "gateway-events.jsonl", "file the gateway appends events to and the dashboard reads live")
+	loopWindow := fs.Duration("loop-window", time.Minute, "window for loop detection")
+	loopMaxReq := fs.Int("loop-max-requests", 0, "requests per run within the window that flag a loop (0 = off)")
+	loopMaxRep := fs.Int("loop-max-repeats", 0, "identical requests per run within the window that flag a loop (0 = off)")
+	maxCalls := fs.Int("max-calls-per-run", 0, "server-wide per-run call cap (0 = off)")
+	maxSpend := fs.Float64("max-spend-per-run", 0, "server-wide per-run spend cap in USD (0 = off; callers can also set X-AxiGate-Max-Spend from code)")
+	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
+	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	base := *upstream
+	switch *provider {
+	case "openai":
+		if base == "" {
+			base = "https://api.openai.com"
+		}
+	case "anthropic":
+		if base == "" {
+			base = "https://api.anthropic.com"
+		}
+	default:
+		return fmt.Errorf("serve needs --provider openai or anthropic")
+	}
+	f, err := os.OpenFile(*ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gw := gateway.New(gateway.Config{
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f),
+		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
+	})
+	con := console.New(nil)
+	con.SetLedgerFile(*ledgerPath) // live: the dashboard re-reads the shared ledger per request
+
+	gwSrv := &http.Server{Addr: *gwListen, Handler: gw, ReadHeaderTimeout: 30 * time.Second}
+	conSrv := &http.Server{Addr: *consoleListen, Handler: con, ReadHeaderTimeout: 30 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errc := make(chan error, 2)
+	go func() { errc <- gwSrv.ListenAndServe() }()
+	go func() { errc <- conSrv.ListenAndServe() }()
+	fmt.Printf("axigate-finops serve (%s):\n"+
+		"  gateway    http://%s   → point your app's base URL here, keep your normal key\n"+
+		"  dashboard  http://%s   → open in a browser; spend appears live\n"+
+		"  ledger     %s (metadata only)\n"+
+		"  inline cap: set X-AxiGate-Run and X-AxiGate-Max-Spend in your code to cap a run, no restart\n",
+		*provider, *gwListen, *consoleListen, *ledgerPath)
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		fmt.Fprintln(os.Stderr, "\naxigate-finops serve: shutting down")
+		_ = gwSrv.Shutdown(shutCtx)
+		return conSrv.Shutdown(shutCtx)
+	}
+}
+
+func doSeed(args []string) error {
+	fs := flag.NewFlagSet("seed", flag.ContinueOnError)
+	out := fs.String("out", "", "JSONL file to write the synthetic events to")
+	n := fs.Int("events", 10000, "number of events to generate")
+	seedN := fs.Int64("seed", 1, "RNG seed for a deterministic ledger")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("seed needs --out FILE")
+	}
+	events := seed.Generate(seed.Options{Events: *n, Seed: *seedN})
+	f, err := os.Create(*out)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	rec := gateway.NewJSONLRecorder(f)
+	var total float64
+	var blocked int
+	for _, e := range events {
+		rec.Record(e)
+		total += e.CostUSD
+		if e.Dimensions["blocked"] != "" {
+			blocked++
+		}
+	}
+	fmt.Printf("wrote %d synthetic events to %s\n  total priced spend: $%.2f · blocked (runaway loop): %d\n  next: axigate-finops analyze %s --focus focus.csv\n",
+		len(events), *out, total, blocked, *out)
+	return nil
+}
+
+func doConsole(args []string) error {
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	ledgerPath := fs.String("ledger", "", "gateway JSONL ledger to serve")
+	listen := fs.String("listen", "127.0.0.1:8900", "address to listen on")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *ledgerPath == "" {
+		return fmt.Errorf("console needs --ledger FILE (make one with: axigate-finops seed --out demo.jsonl)")
+	}
+	events, _, err := anyfile.Parse(*ledgerPath)
+	if err != nil {
+		return fmt.Errorf("%s: %w", *ledgerPath, err)
+	}
+	// Idempotence: the same row from an appended ledger is one row.
+	seen := map[string]bool{}
+	deduped := events[:0]
+	for _, e := range events {
+		if !seen[e.ID] {
+			seen[e.ID] = true
+			deduped = append(deduped, e)
+		}
+	}
+	srv := console.New(deduped)
+	srv.SetLedgerFile(*ledgerPath) // live: re-read on each request so a refresh shows new gateway events
+	hs := &http.Server{Addr: *listen, Handler: srv, ReadHeaderTimeout: 30 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errc := make(chan error, 1)
+	go func() { errc <- hs.ListenAndServe() }()
+	fmt.Printf("axigate-finops console: http://%s  (%d events; live-reloads %s)\n", *listen, len(deduped), *ledgerPath)
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return hs.Shutdown(shutCtx)
+	}
+}

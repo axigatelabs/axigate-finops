@@ -1,0 +1,25 @@
+# build and local data
+/bin/
+/dist/
+/out/
+*.test
+*.out
+# exports and invoices are customer data; never commit them
+/data/
+*.csv
+*.xlsx
+!testdata/**
+# env
+.env
+.env.*
+# framework state (per-project runtime state, gitignored per HQ rules)
+.cursor/state/
+
+# the locally built binary (go build -o axigate-finops ./cmd/axigate-finops)
+/axigate-finops
+/axigate-finops.exe
+/reports/
+/tiers.json
+
+# generated ledgers (gateway events, seeded demos) — runtime data, never source
+*.jsonl
