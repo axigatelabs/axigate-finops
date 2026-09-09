@@ -32,7 +32,7 @@ binary, so one command runs all of it. Nothing to install, nothing to configure,
 and your keys and prompts never leave your machine:
 
 ```bash
-docker run -p 8080:8080 -p 8906:8906 axigatelabs/axigate-finops:latest
+docker run -p 8080:8080 -p 8906:8906 shmeeee/axigate-finops:latest
 ```
 
 Port `8080` is the gateway you route through; port `8906` is the dashboard. Then
@@ -59,7 +59,7 @@ Nothing is written outside the container, so `Ctrl+C` leaves your laptop clean;
 add `-v "$PWD/axigate-data:/data"` to keep the ledger between runs.
 
 To route Anthropic instead of OpenAI, append the command with your provider:
-`docker run … axigatelabs/axigate-finops:latest serve --provider anthropic`
+`docker run … shmeeee/axigate-finops:latest serve --provider anthropic`
 (point the SDK at `http://localhost:8080`).
 
 ## Quickstart — route an agent through the gateway
