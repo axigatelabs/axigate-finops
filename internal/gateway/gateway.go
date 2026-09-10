@@ -70,6 +70,9 @@ type Config struct {
 	Now      func() time.Time // injectable clock; nil = time.Now
 	Loop     LoopPolicy       // opt-in loop detection; zero value = off
 	Control  ControlPolicy    // opt-in loop control; zero value = off
+	// StopAlertURL, when set, receives a metadata-only JSON POST the moment the
+	// gateway stops a run (Slack/Discord webhook URLs work as-is). Fail-open.
+	StopAlertURL string
 }
 
 // Gateway is an http.Handler that proxies to one provider.
@@ -110,6 +113,9 @@ func New(cfg Config) *Gateway {
 			cfg.Control.Now = cfg.Now
 		}
 		g.ctrl = newController(cfg.Control)
+		if cfg.StopAlertURL != "" {
+			g.ctrl.onPause = newStopAlertSender(cfg.StopAlertURL)
+		}
 	}
 	return g
 }
@@ -153,6 +159,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model := jsonModel(reqBody) // may be overwritten by the response's model
+	if model == "" && g.cfg.Provider == "gemini" {
+		model = geminiModelFromPath(r.URL.Path) // Gemini names the model in the path, not the body
+	}
 	run := strings.TrimSpace(r.Header.Get("X-AxiGate-Run"))
 
 	// Loop detection reads the caller's explicit run id; a request with no run
@@ -169,6 +178,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Loop control refuses a paused or killed request before it leaves. A
 	// bypass credential forces one request through a per-run pause.
 	if g.ctrl != nil {
+		// Note who this run belongs to, so a stop alert can name the agent/team.
+		t := tagsFromHeaders(r.Header)
+		g.ctrl.noteRun(run, t.Agent, t.Team, model)
 		// A caller may set its own per-run spend cap inline, from code, with no
 		// server flag or restart: X-AxiGate-Max-Spend, keyed to the run it names.
 		if g.cfg.Control.AllowRequestCaps {
@@ -232,7 +244,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(flushWriter{w, fl}, io.TeeReader(resp.Body, sniff))
 		if u, m, ok := sniff.result(); ok {
 			usage, gotUsage = u, true
-			if m != "" {
+			if m != "" && !preferRequestModel(g.cfg.Provider, model) {
 				model2 = m
 			}
 		}
@@ -241,7 +253,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(w, io.TeeReader(resp.Body, cap))
 		if u, m, ok := extractUsage(g.cfg.Provider, cap.buf.Bytes()); ok {
 			usage, gotUsage = u, true
-			if m != "" {
+			if m != "" && !preferRequestModel(g.cfg.Provider, model) {
 				model2 = m
 			}
 		}
@@ -444,11 +456,90 @@ type providerUsage struct {
 	} `json:"usage"`
 }
 
+// geminiUsage mirrors a Gemini generateContent response's usage block. The
+// prompt count is inclusive of cached tokens (the table's inclusive
+// convention), and thinking tokens bill as output.
+type geminiUsage struct {
+	ModelVersion  string `json:"modelVersion"`
+	UsageMetadata struct {
+		PromptTokenCount        int64 `json:"promptTokenCount"`
+		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
+		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
+		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
+	} `json:"usageMetadata"`
+}
+
+func (g geminiUsage) usage() (ledger.Usage, bool) {
+	m := g.UsageMetadata
+	if m.PromptTokenCount == 0 && m.CandidatesTokenCount == 0 {
+		return ledger.Usage{}, false
+	}
+	return ledger.Usage{
+		InputTokens:  m.PromptTokenCount, // inclusive of cached, per the table's convention
+		CacheRead:    m.CachedContentTokenCount,
+		OutputTokens: m.CandidatesTokenCount + m.ThoughtsTokenCount,
+	}, true
+}
+
+// extractGeminiUsage reads usage from a generateContent body. A
+// streamGenerateContent call made without alt=sse returns a JSON ARRAY of
+// chunks rather than SSE; the last chunk carries the totals, so both shapes
+// are accepted.
+func extractGeminiUsage(body []byte) (ledger.Usage, string, bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var chunks []geminiUsage
+		if json.Unmarshal(trimmed, &chunks) != nil {
+			return ledger.Usage{}, "", false
+		}
+		for i := len(chunks) - 1; i >= 0; i-- {
+			if u, ok := chunks[i].usage(); ok {
+				return u, chunks[i].ModelVersion, true
+			}
+		}
+		if len(chunks) > 0 {
+			return ledger.Usage{}, chunks[len(chunks)-1].ModelVersion, false
+		}
+		return ledger.Usage{}, "", false
+	}
+	var g geminiUsage
+	if json.Unmarshal(body, &g) != nil {
+		return ledger.Usage{}, "", false
+	}
+	u, ok := g.usage()
+	return u, g.ModelVersion, ok
+}
+
+// geminiModelFromPath reads the model from a Gemini request path, where it
+// lives instead of the body: /v1beta/models/{model}:generateContent (also
+// :streamGenerateContent, :countTokens). "" when the path names no model.
+func geminiModelFromPath(path string) string {
+	i := strings.Index(path, "/models/")
+	if i < 0 {
+		return ""
+	}
+	rest := path[i+len("/models/"):]
+	if j := strings.IndexAny(rest, ":/"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// preferRequestModel says whether to keep the model the caller asked for over
+// the one the response reports. Gemini's modelVersion can be a variant string
+// the price table does not list, while the path names the family we do price.
+func preferRequestModel(provider, requestModel string) bool {
+	return provider == "gemini" && requestModel != ""
+}
+
 // extractUsage reads token counts from a non-streaming response body for the
-// given provider, normalizing to the ledger's convention (openai input is
-// inclusive of cache reads; anthropic input is the uncached figure). ok is
-// false when no usage block was present.
+// given provider, normalizing to the ledger's convention (openai and gemini
+// input is inclusive of cache reads; anthropic input is the uncached figure).
+// ok is false when no usage block was present.
 func extractUsage(provider string, body []byte) (ledger.Usage, string, bool) {
+	if provider == "gemini" {
+		return extractGeminiUsage(body)
+	}
 	var p providerUsage
 	if err := json.Unmarshal(body, &p); err != nil {
 		return ledger.Usage{}, "", false

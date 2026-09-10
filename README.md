@@ -1,7 +1,8 @@
 # axigate-finops
 
 **Stop runaway AI agents from burning your API budget.** A self-hosted,
-metadata-only FinOps gateway and local dashboard for OpenAI and Anthropic.
+metadata-only FinOps gateway and local dashboard for OpenAI, Anthropic and
+Gemini.
 
 Point your agents at a drop-in proxy. It forwards every call unchanged, stops a
 run that loops or blows a budget before it reaches the provider, attributes
@@ -58,9 +59,9 @@ crosses $5, the next call is refused with a `429` before it reaches OpenAI.
 Nothing is written outside the container, so `Ctrl+C` leaves your laptop clean;
 add `-v "$PWD/axigate-data:/data"` to keep the ledger between runs.
 
-To route Anthropic instead of OpenAI, append the command with your provider:
-`docker run … shmeeee/axigate-finops:latest serve --provider anthropic`
-(point the SDK at `http://localhost:8080`).
+To route Anthropic or Gemini instead of OpenAI, append the command with your
+provider — `docker run … shmeeee/axigate-finops:latest serve --provider anthropic`
+or `--provider gemini` — and point that SDK at `http://localhost:8080`.
 
 ## Quickstart — route an agent through the gateway
 
@@ -99,6 +100,16 @@ const client = new OpenAI({ baseURL: "http://localhost:8787/v1" });      // 1. r
 await client.chat.completions.create(
   { model: "gpt-4o", messages },
   { headers: { "X-AxiGate-Run": runId, "X-AxiGate-Agent": "planner" } }); // 2. tag the run
+```
+
+**Python (Gemini):** run the gateway with `--provider gemini`, then
+
+```python
+from google import genai
+client = genai.Client(http_options={"base_url": "http://localhost:8787"})      # 1. route through the gateway
+resp = client.models.generate_content(
+    model="gemini-2.5-flash", contents=msgs,
+    config={"http_options": {"headers": {"X-AxiGate-Run": run_id, "X-AxiGate-Agent": "planner"}}})  # 2. tag the run
 ```
 
 That's it. Every call is now priced, attributed to `planner` and `run_id`, and
@@ -201,6 +212,29 @@ is the backstop, not a replacement. For a single well-configured agent in one
 framework, the framework cap is simpler and free; the gateway earns its place at
 team scale, across many agents and providers, where you want uniform control and
 the finance byproduct.
+
+## Get told the moment a run is stopped
+
+Refusing the next call is the safety; knowing it happened is the point. Give
+the gateway a webhook and it POSTs a small JSON message the instant a run is
+stopped — metadata only, never a prompt:
+
+```bash
+axigate-finops serve --provider openai --stop-alert-url https://hooks.slack.com/services/…
+```
+
+A Slack incoming-webhook or Discord webhook URL works as-is (the body carries
+the line under both `text` and `content`), so it lands in your channel:
+
+> AxiGate stopped refund-reconciler (run refund-batch-10) — run reached the
+> spend cap of $0.05. 7 calls, $0.05 spent so far; further calls are being
+> refused.
+
+Anything else gets the structured fields too (`event`, `run`, `agent`, `team`,
+`model`, `reason`, `calls`, `spend_usd`, `at`). It fires once per stop, not once
+per refused call, and it is fail-open: a slow or dead webhook is logged and
+dropped, never allowed to touch a request. `AXIGATE_STOP_ALERT_URL` works in
+place of the flag.
 
 ## Honest about the limits
 
