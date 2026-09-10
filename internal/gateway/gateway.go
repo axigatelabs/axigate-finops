@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -45,6 +46,13 @@ const SourceGateway = "gateway"
 // usage. The client always receives the whole body; only the copy kept for
 // parsing is capped. Usage blocks are small, so this is generous.
 const defaultMaxBody = 1 << 20 // 1 MiB
+
+// maxRequestBody bounds the request body the gateway buffers so it can forward
+// it unchanged and, with loop detection on, hash it for the per-run signature.
+// It is far larger than any normal LLM request; a body past it is refused with
+// 413, never silently truncated. This is separate from defaultMaxBody, which
+// bounds only the response copy kept for usage parsing.
+const maxRequestBody = 64 << 20 // 64 MiB
 
 // Recorder receives one event per request. Implementations must not block the
 // response path for long and must treat the event as metadata.
@@ -78,7 +86,13 @@ func New(cfg Config) *Gateway {
 		cfg.MaxBody = defaultMaxBody
 	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 10 * time.Minute}
+		// Bound only the wait for the upstream to START responding, not the whole
+		// exchange: a whole-exchange Client.Timeout severs a long-running stream
+		// mid-body under a 200. Once headers arrive, the streamed body is governed
+		// by the caller's request context (a client disconnect cancels it).
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.ResponseHeaderTimeout = 10 * time.Minute
+		cfg.Client = &http.Client{Transport: tr}
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -126,8 +140,18 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := g.cfg.Now().UTC()
-	reqBody, _ := io.ReadAll(io.LimitReader(r.Body, g.cfg.MaxBody))
+	// Buffer the WHOLE request body so it is forwarded unchanged and, with loop
+	// detection on, hashed for the per-run signature. Read one byte past the
+	// ceiling so an over-limit body is refused (413) rather than silently
+	// truncated — a call is never corrupted. (MaxBody, in contrast, bounds only
+	// the response copy kept for usage parsing.)
+	reqBody, _ := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
 	_ = r.Body.Close()
+	if int64(len(reqBody)) > maxRequestBody {
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			"axigate gateway: request body exceeds the 64 MiB limit")
+		return
+	}
 	model := jsonModel(reqBody) // may be overwritten by the response's model
 	run := strings.TrimSpace(r.Header.Get("X-AxiGate-Run"))
 
@@ -197,7 +221,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	usage, gotUsage, model2 := ledger.Usage{}, false, model
 	if streamed {
 		sniff := newSSEUsage(g.cfg.Provider, g.cfg.MaxBody)
-		_, _ = io.Copy(w, io.TeeReader(resp.Body, sniff))
+		fl, _ := w.(http.Flusher)
+		_, _ = io.Copy(flushWriter{w, fl}, io.TeeReader(resp.Body, sniff))
 		if u, m, ok := sniff.result(); ok {
 			usage, gotUsage = u, true
 			if m != "" {
@@ -230,8 +255,8 @@ func parseMoney(s string) float64 {
 		return 0
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil || v <= 0 {
-		return 0
+	if err != nil || v <= 0 || math.IsInf(v, 0) || math.IsNaN(v) {
+		return 0 // reject non-positive and non-finite (Inf/NaN) — never a live "no cap"
 	}
 	return v
 }
@@ -343,6 +368,22 @@ func tagsFromHeaders(h http.Header) ledger.Tags {
 		Agent:    strings.TrimSpace(h.Get("X-AxiGate-Agent")),
 		Run:      strings.TrimSpace(h.Get("X-AxiGate-Run")),
 	}
+}
+
+// flushWriter flushes to the client after every write, so a streamed (SSE)
+// response reaches the client frame by frame instead of buffering in the
+// server's chunk buffer until ~2 KB accumulates. A nil flusher is a no-op.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
 }
 
 // capWriter keeps at most limit bytes and silently drops the rest, so a large

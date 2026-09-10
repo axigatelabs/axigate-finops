@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/axigatelabs/axigate-finops/internal/ledger"
 	"github.com/axigatelabs/axigate-finops/internal/report"
 	"github.com/axigatelabs/axigate-finops/internal/seed"
 )
@@ -78,5 +79,22 @@ func TestFOCUSExcludesBlockedRowsButKeepsTheirTagsElsewhere(t *testing.T) {
 	// appear as a $0.000000 row; the invariant that matters is the money sum.
 	if billedRows == 0 {
 		t.Fatal("no rows written")
+	}
+}
+
+// TestRowGuardsAgainstCSVFormulaInjection proves a caller-set tag that would be
+// a live spreadsheet formula is neutralized to literal text in the export.
+func TestRowGuardsAgainstCSVFormulaInjection(t *testing.T) {
+	e := ledger.Event{
+		Provider: "openai", Model: "gpt-4o", Period: "2026-09",
+		Tags:       ledger.Tags{Agent: `=HYPERLINK("http://evil",A1)`, Team: "-2+3"},
+		Confidence: ledger.Estimated,
+	}
+	r := Row(e, "acct")
+	if got := r["x_Agent"]; got == "" || got[0] != '\'' {
+		t.Fatalf("x_Agent formula not neutralized: %q", got)
+	}
+	if got := r["x_Team"]; got == "" || got[0] != '\'' {
+		t.Fatalf("x_Team formula not neutralized: %q", got)
 	}
 }

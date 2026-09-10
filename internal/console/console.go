@@ -13,10 +13,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/axigatelabs/axigate-finops/internal/focus"
@@ -35,6 +37,12 @@ type Server struct {
 	// request, so a dashboard refresh reflects events the gateway has appended
 	// since boot. Empty = serve the fixed events from New.
 	ledgerPath string
+
+	// memoized live-ledger read, keyed on the file's size+modtime so a burst of
+	// dashboard requests doesn't re-parse a large ledger every time.
+	ledgerMu    sync.Mutex
+	ledgerCache []ledger.Event
+	ledgerKey   string
 }
 
 // New builds a server over events. Pass a nil slice with SetLedgerFile to serve
@@ -116,11 +124,33 @@ type scope struct {
 
 func (s *Server) scopeFor() scope {
 	if s.ledgerPath != "" {
-		evs := readLedgerFile(s.ledgerPath)
+		evs := s.liveLedger()
 		e, l := boundsOf(evs)
 		return scope{evs: evs, earliest: e, latest: l}
 	}
 	return scope{evs: s.events, earliest: s.earliest, latest: s.latest}
+}
+
+// liveLedger reads the ledger file, memoized on the file's size+modtime so a
+// burst of dashboard requests doesn't re-parse a large ledger every time. The
+// gateway only appends, so a changed size or modtime means there is new data to
+// read; readLedgerFile builds a fresh slice each time, so the cached slice is
+// never mutated in place and is safe to hand to concurrent readers.
+func (s *Server) liveLedger() []ledger.Event {
+	fi, err := os.Stat(s.ledgerPath)
+	if err != nil {
+		return readLedgerFile(s.ledgerPath)
+	}
+	key := fmt.Sprintf("%d:%d", fi.Size(), fi.ModTime().UnixNano())
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+	if key == s.ledgerKey && s.ledgerCache != nil {
+		return s.ledgerCache
+	}
+	evs := readLedgerFile(s.ledgerPath)
+	s.ledgerCache = evs
+	s.ledgerKey = key
+	return evs
 }
 
 // windowOf resolves a requested day count. Days <= 0 means "all time".
@@ -129,7 +159,14 @@ func windowOf(sc scope, reqDays int) (from time.Time, days int) {
 	if days <= 0 {
 		return sc.earliest, 0
 	}
-	return sc.latest.Add(-time.Duration(days) * 24 * time.Hour), days
+	if days > 36600 { // ~100 years; guard against an absurd ?days= value overflowing the duration
+		days = 36600
+	}
+	from = sc.latest.Add(-time.Duration(days) * 24 * time.Hour)
+	if from.Before(sc.earliest) {
+		from = sc.earliest
+	}
+	return from, days
 }
 
 func inWindowOf(sc scope, from time.Time) []ledger.Event {

@@ -199,7 +199,7 @@ func Build(events []ledger.Event) Report {
 			c.CacheRead += e.Usage.CacheRead
 			c.CacheWrite += e.Usage.CacheWrite5m + e.Usage.CacheWrite1h
 			inputUsage := pricing.Usage{InputTokens: e.Usage.InputTokens, CacheRead: e.Usage.CacheRead, CacheWrite5m: e.Usage.CacheWrite5m, CacheWrite1h: e.Usage.CacheWrite1h}
-			full := pricing.FullPriceEquivalent(e.Model, inputUsage)
+			full := pricing.FullPriceEquivalent(e.Provider, e.Model, inputUsage)
 			priced := pricing.Price(e.Provider, e.Model, inputUsage)
 			if full > priced.USD {
 				c.ReadSavingsUSD += full - priced.USD

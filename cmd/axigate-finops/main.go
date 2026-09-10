@@ -298,7 +298,7 @@ func doGateway(args []string) error {
 		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
 	})
 
-	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second}
+	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, 1)
@@ -374,8 +374,8 @@ func doServe(args []string) error {
 	con := console.New(nil)
 	con.SetLedgerFile(*ledgerPath) // live: the dashboard re-reads the shared ledger per request
 
-	gwSrv := &http.Server{Addr: *gwListen, Handler: gw, ReadHeaderTimeout: 30 * time.Second}
-	conSrv := &http.Server{Addr: *consoleListen, Handler: con, ReadHeaderTimeout: 30 * time.Second}
+	gwSrv := &http.Server{Addr: *gwListen, Handler: gw, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
+	conSrv := &http.Server{Addr: *consoleListen, Handler: con, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, 2)
@@ -456,7 +456,7 @@ func doConsole(args []string) error {
 	}
 	srv := console.New(deduped)
 	srv.SetLedgerFile(*ledgerPath) // live: re-read on each request so a refresh shows new gateway events
-	hs := &http.Server{Addr: *listen, Handler: srv, ReadHeaderTimeout: 30 * time.Second}
+	hs := &http.Server{Addr: *listen, Handler: srv, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, 1)

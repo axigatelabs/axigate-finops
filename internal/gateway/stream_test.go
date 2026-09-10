@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/axigatelabs/axigate-finops/internal/ledger"
 )
@@ -96,8 +97,13 @@ func TestStreamedRequestIsPricedEndToEnd(t *testing.T) {
 	if !strings.Contains(string(body), "message_delta") {
 		t.Fatalf("stream not passed through: %s", body)
 	}
-	if len(rec.events) != 1 {
-		t.Fatalf("events: %d", len(rec.events))
+	// record() runs in the server goroutine after the streamed body is relayed;
+	// wait for it rather than racing the client's read completion.
+	for i := 0; i < 200 && rec.count() == 0; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if rec.count() != 1 {
+		t.Fatalf("events: %d", rec.count())
 	}
 	e := rec.events[0]
 	if e.Dimensions["stream"] != "true" || e.Dimensions["usage"] == "unknown" {

@@ -3,7 +3,6 @@ package console
 import (
 	"html/template"
 	"net/http"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -145,9 +144,10 @@ func runDetail(events []ledger.Event, run string) RunDetail {
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
-	raw := strings.TrimPrefix(r.URL.Path, "/run/")
-	run, err := url.PathUnescape(raw)
-	if err != nil || run == "" {
+	// r.URL.Path is already percent-decoded by net/http; unescaping it again
+	// would double-decode a run id containing a literal '%'. Trim and use it.
+	run := strings.TrimPrefix(r.URL.Path, "/run/")
+	if run == "" {
 		http.NotFound(w, r)
 		return
 	}

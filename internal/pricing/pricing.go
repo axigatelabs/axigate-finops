@@ -164,7 +164,18 @@ func Price(provider, model string, u Usage) Cost {
 // FullPriceEquivalent is what the same input tokens would have cost with no
 // cache at all: the "you would have paid" half of a cache-leakage line. Output
 // tokens are excluded because caching never touches them.
-func FullPriceEquivalent(model string, u Usage) float64 {
+//
+// It is provider-aware, matching Price's inclusive/exclusive semantics: for
+// inclusive providers (openai, gemini, and the unknown-provider default)
+// InputTokens already counts the cache buckets, so they are NOT re-added;
+// re-adding them would double-count cached tokens and overstate the savings.
+// For exclusive providers (anthropic) InputTokens is the uncached figure, so
+// the full token count is the uncached input plus every cached token.
+func FullPriceEquivalent(provider, model string, u Usage) float64 {
 	_, rate, _ := Resolve(model)
-	return float64(u.InputTokens+u.CacheRead+u.CacheWrite5m+u.CacheWrite1h) * rate.InputPerToken
+	total := u.InputTokens
+	if p, known := Providers[provider]; known && !p.Inclusive {
+		total = u.InputTokens + u.CacheRead + u.CacheWrite5m + u.CacheWrite1h
+	}
+	return float64(total) * rate.InputPerToken
 }
