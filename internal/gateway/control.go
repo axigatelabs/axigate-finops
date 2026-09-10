@@ -51,6 +51,22 @@ type runState struct {
 	paused      bool
 	reason      string
 	lastSeen    time.Time
+	// Attribution noted from the run's requests, so a stop alert can say WHO was
+	// stopped, not just which run id. Metadata only — never prompt text.
+	agent, team, model string
+}
+
+// StopEvent is what the gateway reports the moment it stops a run: which run,
+// whose it was, why, and what it had spent so far. Metadata only.
+type StopEvent struct {
+	Run      string    `json:"run"`
+	Agent    string    `json:"agent"`
+	Team     string    `json:"team"`
+	Model    string    `json:"model"`
+	Reason   string    `json:"reason"`
+	Calls    int       `json:"calls"`
+	SpendUSD float64   `json:"spend_usd"`
+	At       time.Time `json:"at"`
 }
 
 // spendCapLocked returns the binding spend cap: the strictest of the server-wide
@@ -69,6 +85,10 @@ type controller struct {
 	policy ControlPolicy
 	killed bool
 	runs   map[string]*runState
+	// onPause, when set, receives one StopEvent per run-stop transition. It is
+	// invoked on its own goroutine, never under the lock and never in a request's
+	// path, so a slow or failing alert sink cannot affect a call.
+	onPause func(StopEvent)
 }
 
 func newController(p ControlPolicy) *controller {
@@ -79,6 +99,44 @@ func newController(p ControlPolicy) *controller {
 		p.MaxRuns = 10000
 	}
 	return &controller{policy: p, runs: map[string]*runState{}}
+}
+
+// noteRun records a run's attribution (from the request's X-AxiGate-* headers
+// and model) so a stop alert can name who was stopped. Cheap; called per request.
+func (c *controller) noteRun(run, agent, team, model string) {
+	if run == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.runs[run]
+	if st == nil {
+		st = &runState{}
+		c.runs[run] = st
+	}
+	if agent != "" {
+		st.agent = agent
+	}
+	if team != "" {
+		st.team = team
+	}
+	if model != "" {
+		st.model = model
+	}
+}
+
+// pauseLocked marks a run paused with a reason and dispatches the stop alert
+// exactly once per transition (every caller checks !paused first). The caller
+// holds c.mu; the alert is handed to its own goroutine so nothing here blocks.
+func (c *controller) pauseLocked(run string, st *runState, reason string) {
+	st.paused, st.reason = true, reason
+	if c.onPause != nil {
+		ev := StopEvent{
+			Run: run, Agent: st.agent, Team: st.team, Model: st.model,
+			Reason: reason, Calls: st.calls, SpendUSD: st.spendUSD, At: c.policy.Now().UTC(),
+		}
+		go c.onPause(ev)
+	}
 }
 
 // admit decides whether to forward, before the request leaves, and reserves the
@@ -115,7 +173,7 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 		// spend, counting those already in flight, reach a cap — so a burst of
 		// concurrent calls for one run trips the cap at the boundary.
 		if c.policy.MaxCallsPerRun > 0 && st.calls+st.inflight >= c.policy.MaxCallsPerRun {
-			st.paused, st.reason = true, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun)
+			c.pauseLocked(run, st, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun))
 			return false, st.reason
 		}
 		if cap := c.spendCapLocked(st); cap > 0 {
@@ -124,7 +182,7 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 				avg = st.spendUSD / float64(st.calls)
 			}
 			if st.spendUSD+avg*float64(st.inflight) >= cap {
-				st.paused, st.reason = true, fmt.Sprintf("run reached the spend cap of $%.2f", cap)
+				c.pauseLocked(run, st, fmt.Sprintf("run reached the spend cap of $%.2f", cap))
 				return false, st.reason
 			}
 		}
@@ -157,11 +215,11 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		spendCap := c.spendCapLocked(st)
 		switch {
 		case c.policy.MaxCallsPerRun > 0 && st.calls >= c.policy.MaxCallsPerRun:
-			st.paused, st.reason = true, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun)
+			c.pauseLocked(run, st, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun))
 		case spendCap > 0 && st.spendUSD >= spendCap:
-			st.paused, st.reason = true, fmt.Sprintf("run reached the spend cap of $%.2f", spendCap)
+			c.pauseLocked(run, st, fmt.Sprintf("run reached the spend cap of $%.2f", spendCap))
 		case suspectedLoop && c.policy.PauseOnSuspectedLoop:
-			st.paused, st.reason = true, "suspected loop"
+			c.pauseLocked(run, st, "suspected loop")
 		}
 	}
 	c.evict()

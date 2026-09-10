@@ -66,6 +66,15 @@ type sseFrame struct {
 		Usage rawUsage `json:"usage"`
 	} `json:"message"`
 	Usage rawUsage `json:"usage"`
+	// Gemini (streamGenerateContent?alt=sse): every chunk may carry running
+	// totals under usageMetadata; the last one wins.
+	ModelVersion  string `json:"modelVersion"`
+	UsageMetadata struct {
+		PromptTokenCount        int64 `json:"promptTokenCount"`
+		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
+		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
+		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
+	} `json:"usageMetadata"`
 }
 
 type rawUsage struct {
@@ -101,6 +110,8 @@ func (s *sseUsage) consume(line []byte) {
 		s.model = f.Model
 	} else if f.Message.Model != "" {
 		s.model = f.Message.Model
+	} else if f.ModelVersion != "" {
+		s.model = f.ModelVersion
 	}
 	switch s.provider {
 	case "openai":
@@ -127,6 +138,16 @@ func (s *sseUsage) consume(line []byte) {
 		}
 		if f.Usage.OutputTokens > 0 {
 			s.usage.OutputTokens = f.Usage.OutputTokens
+			s.got = true
+		}
+	case "gemini":
+		// Chunks carry running totals under usageMetadata; the last one wins.
+		// The prompt count is inclusive of cached tokens; thinking bills as output.
+		m := f.UsageMetadata
+		if m.PromptTokenCount > 0 || m.CandidatesTokenCount > 0 {
+			s.usage.InputTokens = m.PromptTokenCount
+			s.usage.CacheRead = m.CachedContentTokenCount
+			s.usage.OutputTokens = m.CandidatesTokenCount + m.ThoughtsTokenCount
 			s.got = true
 		}
 	}

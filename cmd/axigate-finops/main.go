@@ -35,8 +35,8 @@ Usage:
   axigate-finops analyze <report.json>... [--owners owners.csv] [--out DIR]
   axigate-finops fetch openai    --since YYYY-MM-DD [--until YYYY-MM-DD] --out DIR   (OPENAI_ADMIN_KEY)
   axigate-finops fetch anthropic --since YYYY-MM-DD [--until YYYY-MM-DD] --out DIR   (ANTHROPIC_ADMIN_KEY)
-  axigate-finops gateway --provider openai|anthropic --upstream URL [--listen ADDR] [--ledger FILE]
-  axigate-finops serve [--provider openai|anthropic] [--gateway-listen ADDR] [--console-listen ADDR] [--ledger FILE]
+  axigate-finops gateway --provider openai|anthropic|gemini --upstream URL [--listen ADDR] [--ledger FILE]
+  axigate-finops serve [--provider openai|anthropic|gemini] [--gateway-listen ADDR] [--console-listen ADDR] [--ledger FILE]
   axigate-finops seed --out FILE [--events N] [--seed N]
   axigate-finops console --ledger FILE [--listen ADDR]
 
@@ -257,9 +257,18 @@ func doFetch(args []string) error {
 	return nil
 }
 
+// envOr returns the flag value, or the named environment variable when the flag
+// was left empty — so a secret-ish URL can stay out of the command line.
+func envOr(flagVal, env string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	return os.Getenv(env)
+}
+
 func doGateway(args []string) error {
 	fs := flag.NewFlagSet("gateway", flag.ContinueOnError)
-	provider := fs.String("provider", "", "openai or anthropic (usage extraction and pricing)")
+	provider := fs.String("provider", "", "openai, anthropic or gemini (usage extraction and pricing)")
 	upstream := fs.String("upstream", "", "provider base URL; default: the provider's own")
 	listen := fs.String("listen", "127.0.0.1:8787", "address to listen on")
 	ledgerPath := fs.String("ledger", "gateway-events.jsonl", "file to append metadata-only events to")
@@ -271,6 +280,7 @@ func doGateway(args []string) error {
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints (empty = no bypass, no admin)")
 	requestCaps := fs.Bool("request-caps", true, "honor a caller's X-AxiGate-Max-Spend header as a per-run spend cap set from code")
+	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -284,8 +294,12 @@ func doGateway(args []string) error {
 		if base == "" {
 			base = "https://api.anthropic.com"
 		}
+	case "gemini":
+		if base == "" {
+			base = "https://generativelanguage.googleapis.com"
+		}
 	default:
-		return fmt.Errorf("gateway needs --provider openai or anthropic")
+		return fmt.Errorf("gateway needs --provider openai, anthropic or gemini")
 	}
 	f, err := os.OpenFile(*ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -293,7 +307,7 @@ func doGateway(args []string) error {
 	}
 	defer f.Close()
 	gw := gateway.New(gateway.Config{
-		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f),
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
 		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
 	})
@@ -333,7 +347,7 @@ func doGateway(args []string) error {
 // runs by default.
 func doServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	provider := fs.String("provider", "openai", "openai or anthropic (usage extraction and pricing)")
+	provider := fs.String("provider", "openai", "openai, anthropic or gemini (usage extraction and pricing)")
 	upstream := fs.String("upstream", "", "provider base URL; default: the provider's own")
 	gwListen := fs.String("gateway-listen", "0.0.0.0:8080", "address for the gateway; point your app's base URL here")
 	consoleListen := fs.String("console-listen", "0.0.0.0:8906", "address for the dashboard; open it in a browser")
@@ -345,6 +359,7 @@ func doServe(args []string) error {
 	maxSpend := fs.Float64("max-spend-per-run", 0, "server-wide per-run spend cap in USD (0 = off; callers can also set X-AxiGate-Max-Spend from code)")
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints")
+	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -358,8 +373,12 @@ func doServe(args []string) error {
 		if base == "" {
 			base = "https://api.anthropic.com"
 		}
+	case "gemini":
+		if base == "" {
+			base = "https://generativelanguage.googleapis.com"
+		}
 	default:
-		return fmt.Errorf("serve needs --provider openai or anthropic")
+		return fmt.Errorf("serve needs --provider openai, anthropic or gemini")
 	}
 	f, err := os.OpenFile(*ledgerPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -367,7 +386,7 @@ func doServe(args []string) error {
 	}
 	defer f.Close()
 	gw := gateway.New(gateway.Config{
-		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f),
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
 		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
 	})

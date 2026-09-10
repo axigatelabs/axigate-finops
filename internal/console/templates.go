@@ -103,6 +103,17 @@ a{color:inherit;text-decoration:none}
 .loop-row:hover{border-radius:10px;background:color-mix(in srgb,var(--danger) 6%,transparent)}
 .loop-row:hover .chev{color:var(--danger);transform:translateX(2px)}
 
+/* per-run rollup: same layout as a loop row, neutral (spend, not danger) */
+.run-row{display:flex;align-items:center;gap:13px;padding:12px 0;border-top:1px solid var(--line)}
+.run-row:first-of-type{border-top:0;padding-top:2px}
+.run-row .who{min-width:0}
+.run-row .rid{font-family:var(--mono);font-size:13.5px;color:var(--ink);font-weight:500}
+.run-row .rid a{color:inherit} .run-row .rid a:hover{color:var(--money)}
+.run-row .meta{font-size:12px;color:var(--ink-3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.run-row .right{margin-left:auto;text-align:right;flex:0 0 auto}
+.run-row .amt{font-family:var(--mono);font-size:13.5px;color:var(--ink);font-variant-numeric:tabular-nums}
+.run-row .avoided{font-family:var(--mono);font-size:11.5px;color:var(--money);margin-top:4px}
+
 /* run detail */
 .back{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink-2);font-family:var(--mono);margin-bottom:18px}
 .back:hover{color:var(--ink)}
@@ -192,6 +203,14 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="card"><h2>Spend by agent <span class="ct">{{len .Sum.ByAgent}}</span></h2>
     {{range .Sum.ByAgent}}<div class="bar"><div class="lbl"><div class="nm">{{.Key}}</div><div class="track"><span class="fill" style="{{barWidth .USD $.MaxAgent}}"></span></div></div><div class="amt">{{usd .USD}}</div></div>{{else}}<div class="empty">No spend in this range.</div>{{end}}
   </div>
+</div>
+
+<div class="card runs" style="margin-bottom:16px"><h2>Spend by run <span class="ct">top {{len .Sum.ByRun}} by spend</span></h2>
+  {{range .Sum.ByRun}}<div class="run-row">
+      <div class="who"><div class="rid">{{if ne .Run "(untagged)"}}<a href="/run/{{urlquery .Run}}">{{.Run}}</a>{{else}}{{.Run}}{{end}}</div>
+        <div class="meta">{{if .Agent}}{{.Agent}}{{else}}unknown agent{{end}}{{if .Model}} · <span class="num">{{.Model}}</span>{{end}} · <span class="num">{{.Calls}}</span> calls{{if .Failed}} · <span class="num">{{.Failed}}</span> failed{{end}}{{if .Blocked}} · <span class="num">{{.Blocked}}</span> refused{{end}}</div></div>
+      <div class="right"><div class="amt">{{usd .SpentUSD}}</div>{{if .Blocked}}<div class="avoided">≈{{usd .AvoidedUSD}} prevented</div>{{end}}</div>
+    </div>{{else}}<div class="empty">No runs in this range. Tag calls with <span class="num">X-AxiGate-Run</span> and each run rolls up here — spend, calls, failures and refusals in one line.</div>{{end}}
 </div>
 
 <div class="card loops" style="margin-bottom:16px"><h2>Runaway loops the gateway stopped

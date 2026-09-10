@@ -18,6 +18,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -217,10 +218,29 @@ type Summary struct {
 	ByModel      []Line       `json:"by_model"`
 	LoopsBlocked int          `json:"loops_blocked"`
 	BlockedRuns  []BlockedRun `json:"blocked_runs"`
+	ByRun        []RunLine    `json:"by_run"` // top runs by spend — cost per run, not just per call
 	Daily        []DayPoint   `json:"daily"`
 	PeakDayUSD   float64      `json:"peak_day_usd"`
 	AvoidedUSD   float64      `json:"avoided_usd"`
 }
+
+// RunLine is one run's rollup: what it spent, how many calls that took, how
+// many failed or were refused, and what the refusals prevented. Retries and
+// dead work are where a budget actually disappears, and a per-call list hides
+// that; a per-run line shows it.
+type RunLine struct {
+	Run        string  `json:"run"`
+	Agent      string  `json:"agent"`
+	Model      string  `json:"model"`
+	Calls      int     `json:"calls"`   // served (successful or failed), not refused
+	Failed     int     `json:"failed"`  // served but the provider returned a non-2xx
+	Blocked    int     `json:"blocked"` // refused by the gateway
+	SpentUSD   float64 `json:"spent_usd"`
+	AvoidedUSD float64 `json:"avoided_usd"`
+}
+
+// maxRunLines bounds the per-run rollup shown on the dashboard and in the API.
+const maxRunLines = 12
 
 func linesOf(m map[string]float64) []Line {
 	out := make([]Line, 0, len(m))
@@ -260,6 +280,7 @@ func summaryOf(sc scope, reqDays int) Summary {
 	// calls were refused. The average successful call estimates what each
 	// refused call would have cost.
 	sumByRun, cntByRun := map[string]float64{}, map[string]int{}
+	callsByRun, failedByRun := map[string]int{}, map[string]int{} // every served call, and the non-2xx ones
 	agentByRun, modelByRun := map[string]string{}, map[string]string{}
 	var globalSum float64
 	var globalCnt int
@@ -274,6 +295,16 @@ func summaryOf(sc scope, reqDays int) Summary {
 				modelByRun[e.Tags.Run] = e.Model
 			}
 			continue
+		}
+		callsByRun[e.Tags.Run]++
+		if s := e.Dimensions["status"]; s != "" && !strings.HasPrefix(s, "2") {
+			failedByRun[e.Tags.Run]++ // dead work: it ran, the provider errored
+		}
+		if agentByRun[e.Tags.Run] == "" {
+			agentByRun[e.Tags.Run] = e.Tags.Agent
+		}
+		if modelByRun[e.Tags.Run] == "" {
+			modelByRun[e.Tags.Run] = e.Model
 		}
 		if e.CostUSD > 0 {
 			sumByRun[e.Tags.Run] += e.CostUSD
@@ -311,6 +342,41 @@ func summaryOf(sc scope, reqDays int) Summary {
 		return runs[i].Blocked > runs[j].Blocked
 	})
 
+	// Cost per run: every run seen (served or refused), spend-first, so retry
+	// storms and dead work surface as one expensive line instead of many cheap
+	// calls. Untagged calls roll up under one line and never get a drill-down.
+	seenRun := map[string]bool{}
+	for run := range callsByRun {
+		seenRun[run] = true
+	}
+	for run := range byRun {
+		seenRun[run] = true
+	}
+	byRunLines := make([]RunLine, 0, len(seenRun))
+	for run := range seenRun {
+		name := run
+		if name == "" {
+			name = "(untagged)"
+		}
+		byRunLines = append(byRunLines, RunLine{
+			Run: name, Agent: agentByRun[run], Model: modelByRun[run],
+			Calls: callsByRun[run], Failed: failedByRun[run], Blocked: byRun[run],
+			SpentUSD: sumByRun[run], AvoidedUSD: avgCall(run) * float64(byRun[run]),
+		})
+	}
+	sort.Slice(byRunLines, func(i, j int) bool {
+		if byRunLines[i].SpentUSD != byRunLines[j].SpentUSD {
+			return byRunLines[i].SpentUSD > byRunLines[j].SpentUSD
+		}
+		if byRunLines[i].AvoidedUSD != byRunLines[j].AvoidedUSD {
+			return byRunLines[i].AvoidedUSD > byRunLines[j].AvoidedUSD
+		}
+		return byRunLines[i].Run < byRunLines[j].Run
+	})
+	if len(byRunLines) > maxRunLines {
+		byRunLines = byRunLines[:maxRunLines]
+	}
+
 	byDay := map[string]float64{}
 	for _, e := range report.Included(evs) {
 		byDay[e.StartsAt.UTC().Format("2006-01-02")] += e.CostUSD
@@ -345,7 +411,7 @@ func summaryOf(sc scope, reqDays int) Summary {
 		RangeStart: start.UTC().Format("2006-01-02"), RangeEnd: sc.latest.UTC().Format("2006-01-02"),
 		Events: len(evs), TotalUSD: r.TotalUSD,
 		ByProvider: linesOf(prov), ByTeam: linesOf(byTeam), ByAgent: linesOf(byAgent), ByModel: linesOf(model),
-		LoopsBlocked: blocked, BlockedRuns: runs,
+		LoopsBlocked: blocked, BlockedRuns: runs, ByRun: byRunLines,
 		Daily: daily, PeakDayUSD: peak, AvoidedUSD: avoidedTotal,
 	}
 }
