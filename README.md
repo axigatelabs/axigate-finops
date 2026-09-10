@@ -182,10 +182,12 @@ different place; that is not the point. The difference is:
 - **It stops on dollars, not counts.** Ten calls with a 200k-token context cost
   far more than a hundred tiny ones; a count cap can't tell the difference.
   `--max-spend-per-run` stops on the money.
-- **It survives retries and restarts.** A crash-restart loop resets the
-  framework's counter every time and keeps burning money. The cap is keyed to
-  the `X-AxiGate-Run` id you pass, so it spans restarts a per-process counter
-  never sees.
+- **It survives the agent's crash-restart loop.** When a framework crashes and
+  restarts, its own in-code counter resets each time and keeps burning money.
+  The gateway's cap is keyed to the `X-AxiGate-Run` id you pass, so as long as
+  the gateway stays up it keeps counting a run across those restarts — a
+  per-process framework counter never sees them. (The gateway's *own* restart
+  resets the tally; it lives in memory — see the limits below.)
 - **It's one policy across every framework, language and provider**, owned by
   the platform team, not scattered through app code.
 - **It leaves a receipt.** The same mechanism that blocks produces the
@@ -202,10 +204,12 @@ the finance byproduct.
 
 ## Honest about the limits
 
-- Per-run caps are enforced in memory, so under a burst a few requests already
-  in flight when a cap trips can still get through. The bound is roughly the
-  concurrency; for a sequential agent it is exact. A durable, exact bound under
-  heavy concurrency is on the roadmap.
+- Per-run caps are enforced in memory: the gateway's own restart resets a run's
+  tally, and the cap is per-process (behind a load balancer each replica counts
+  on its own). Each call is reserved at admit, so a concurrent burst trips the
+  cap at the boundary; the residual overshoot is the calls already in flight
+  before the run's first cost is recorded. For a sequential agent it is exact. A
+  durable, exact bound across replicas is the hosted tier's job, on the roadmap.
 - A provider export shows spend, cache use and spikes, but not loops. Loops need
   the request-level data the gateway captures.
 - Nothing is signed below the `invoice-reconciled` state.
