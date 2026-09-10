@@ -13,11 +13,14 @@ import (
 // refused until an operator resumes it (pause and review). A global kill switch
 // refuses everything. A bypass credential forces one request through a pause.
 //
-// The caps are cumulative per run and enforced in memory, so the bound on
-// unauthorized spend is the requests already in flight when the cap trips; an
-// exact bound under heavy concurrency is the durable reservation store, lifted
-// later. A request with no run id cannot be capped, the same honesty as
-// detection: a run is never inferred.
+// The caps are cumulative per run and enforced in memory. A call is reserved at
+// admit — counted against the run before it is served — so a burst of concurrent
+// calls for one run trips the cap at the boundary instead of after ~concurrency
+// of overshoot. The residual bound is the calls already in flight before the
+// run's first cost is recorded (there is no average to reserve against yet); an
+// exact bound ACROSS processes is the durable shared store, lifted later with the
+// paid hosted tier. A request with no run id cannot be capped, the same honesty
+// as detection: a run is never inferred.
 
 // ControlPolicy configures enforcement. It is active only when a cap or the
 // pause-on-loop switch is set, so it is opt-in.
@@ -42,11 +45,23 @@ func (p ControlPolicy) active() bool {
 
 type runState struct {
 	calls       int
+	inflight    int // calls admitted but not yet recorded (the reserve-at-admit count)
 	spendUSD    float64
 	maxSpendUSD float64 // caller-set per-run cap (X-AxiGate-Max-Spend); 0 = none
 	paused      bool
 	reason      string
 	lastSeen    time.Time
+}
+
+// spendCapLocked returns the binding spend cap: the strictest of the server-wide
+// policy and the caller's inline X-AxiGate-Max-Spend, ignoring the ones left off.
+// The caller must hold c.mu.
+func (c *controller) spendCapLocked(st *runState) float64 {
+	cap := c.policy.MaxSpendUSDPerRun
+	if st.maxSpendUSD > 0 && (cap == 0 || st.maxSpendUSD < cap) {
+		cap = st.maxSpendUSD
+	}
+	return cap
 }
 
 type controller struct {
@@ -66,9 +81,13 @@ func newController(p ControlPolicy) *controller {
 	return &controller{policy: p, runs: map[string]*runState{}}
 }
 
-// admit decides whether to forward, before the request leaves. bypass overrides
-// a per-run pause but never the kill switch. An empty run is always admitted:
-// a request the caller did not tag cannot be attributed to a run to cap.
+// admit decides whether to forward, before the request leaves, and reserves the
+// call against its run so concurrent calls see the growing total. bypass
+// overrides a per-run pause but never the kill switch. An empty run is always
+// admitted: a request the caller did not tag cannot be attributed to a run to
+// cap. Every admitted run-tagged call must be balanced by exactly one record
+// (served) or release (errored before serving), so the in-flight count stays
+// honest.
 func (c *controller) admit(run string, bypass bool) (bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -78,9 +97,39 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 	if run == "" {
 		return true, ""
 	}
-	if st := c.runs[run]; st != nil && st.paused && !bypass {
+	st := c.runs[run]
+	if st == nil {
+		st = &runState{}
+		c.runs[run] = st
+	}
+	st.lastSeen = c.policy.Now()
+	if st.paused {
+		if bypass { // a forced-through call is still in flight and will be recorded
+			st.inflight++
+			return true, ""
+		}
 		return false, st.reason
 	}
+	if !bypass {
+		// Reserve-at-admit: refuse (and pause) if the run's calls or projected
+		// spend, counting those already in flight, reach a cap — so a burst of
+		// concurrent calls for one run trips the cap at the boundary.
+		if c.policy.MaxCallsPerRun > 0 && st.calls+st.inflight >= c.policy.MaxCallsPerRun {
+			st.paused, st.reason = true, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun)
+			return false, st.reason
+		}
+		if cap := c.spendCapLocked(st); cap > 0 {
+			avg := 0.0
+			if st.calls > 0 {
+				avg = st.spendUSD / float64(st.calls)
+			}
+			if st.spendUSD+avg*float64(st.inflight) >= cap {
+				st.paused, st.reason = true, fmt.Sprintf("run reached the spend cap of $%.2f", cap)
+				return false, st.reason
+			}
+		}
+	}
+	st.inflight++
 	return true, ""
 }
 
@@ -98,16 +147,14 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		st = &runState{}
 		c.runs[run] = st
 	}
+	if st.inflight > 0 { // release this call's admit-time reservation
+		st.inflight--
+	}
 	st.calls++
 	st.spendUSD += costUSD
 	st.lastSeen = c.policy.Now()
 	if !st.paused {
-		// The binding spend cap is the strictest of the server-wide policy and
-		// the caller's own X-AxiGate-Max-Spend, ignoring the ones left off.
-		spendCap := c.policy.MaxSpendUSDPerRun
-		if st.maxSpendUSD > 0 && (spendCap == 0 || st.maxSpendUSD < spendCap) {
-			spendCap = st.maxSpendUSD
-		}
+		spendCap := c.spendCapLocked(st)
 		switch {
 		case c.policy.MaxCallsPerRun > 0 && st.calls >= c.policy.MaxCallsPerRun:
 			st.paused, st.reason = true, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun)
@@ -118,6 +165,22 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		}
 	}
 	c.evict()
+}
+
+// release returns an admitted call's in-flight reservation without recording a
+// cost, for a call that never reached the provider (a request-build or dial
+// error). It keeps the in-flight count honest so the reserve-at-admit bound does
+// not drift toward over-blocking. An empty run, or a run with nothing in flight,
+// is a no-op.
+func (c *controller) release(run string) {
+	if run == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.runs[run]; st != nil && st.inflight > 0 {
+		st.inflight--
+	}
 }
 
 // setRunCap records a caller-supplied per-run spend cap (the X-AxiGate-Max-Spend
@@ -146,7 +209,11 @@ func (c *controller) resumeRun(run string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if st := c.runs[run]; st != nil && st.paused {
+		// Resume grants a fresh allowance: clear the pause and the tallies that
+		// tripped the cap, so the reviewed run continues under a full budget
+		// instead of re-pausing on its own history at the next admit.
 		st.paused, st.reason = false, ""
+		st.calls, st.spendUSD, st.inflight = 0, 0, 0
 		return true
 	}
 	return false

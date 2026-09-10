@@ -195,6 +195,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(reqBody))
 	if err != nil {
+		if g.ctrl != nil { // the call was admitted but never left; free its reservation
+			g.ctrl.release(run)
+		}
 		http.Error(w, "gateway: bad request: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -204,7 +207,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := g.cfg.Client.Do(outReq)
 	if err != nil {
 		// The provider is unreachable. We cannot invent a response; the client
-		// sees the failure. We do not record a cost for a call that never billed.
+		// sees the failure. We do not record a cost for a call that never billed,
+		// so free the admit-time reservation instead.
+		if g.ctrl != nil {
+			g.ctrl.release(run)
+		}
 		http.Error(w, "gateway: upstream unreachable: "+err.Error(), http.StatusBadGateway)
 		return
 	}
