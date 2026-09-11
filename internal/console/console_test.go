@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -205,5 +206,123 @@ func TestUnknownCostCallsAreNamedNotFree(t *testing.T) {
 	raw2, _ := io.ReadAll(resp2.Body)
 	if strings.Contains(string(raw2), "came back without usage") {
 		t.Fatal("no unknown-cost footnote without such a call")
+	}
+}
+
+// Spend rolls up per API key too, refusals included, from the fingerprint the
+// gateway recorded — never the key.
+func TestSpendByKeyRollsUpCallsAndRefusals(t *testing.T) {
+	base := seed.Generate(seed.Options{Events: 6, Seed: 12})
+	var evs []ledger.Event
+	for i, e := range base {
+		e.Dimensions = map[string]string{"status": "200", "request_id": "k" + strconv.Itoa(i), "key": "k-3fa9c2b1e0d4-7788"}
+		if i == 0 {
+			e.Dimensions["key_name"] = "ci-runner" // a label the caller gave; the fingerprint stays the identity
+		}
+		if i == 5 { // a refusal on the same key, on a call with no run
+			e.Dimensions["status"], e.Dimensions["blocked"] = "429", "key …7788 reached its daily spend cap of $1.00 (resets at midnight UTC)"
+			e.CostUSD = 0
+			e.Usage = ledger.Usage{}
+			e.Tags.Run = ""
+		}
+		e.DeriveID()
+		evs = append(evs, e)
+	}
+	srv := httptest.NewServer(New(evs))
+	defer srv.Close()
+	sum := getSummary(t, srv.URL, "/api/summary?days=all")
+	if len(sum.ByKey) != 1 || sum.ByKey[0].Label != "ci-runner (…7788)" || sum.ByKey[0].Calls != 5 || sum.ByKey[0].Blocked != 1 || sum.ByKey[0].SpentUSD <= 0 {
+		t.Fatalf("by_key = %+v", sum.ByKey)
+	}
+	if sum.LoopsBlocked != 0 || len(sum.BlockedRuns) != 0 {
+		t.Fatalf("a key at its cap is not a runaway loop: blocked=%d runs=%+v", sum.LoopsBlocked, sum.BlockedRuns)
+	}
+	resp, err := http.Get(srv.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "Spend by key") || !strings.Contains(string(raw), "key ci-runner (…7788)") || !strings.Contains(string(raw), "1</span> refused") || strings.Contains(string(raw), `href="/run/"`) {
+		t.Fatal("dashboard should show the key with its refusal")
+	}
+	// No key dimension anywhere: the card stays away.
+	plain := httptest.NewServer(New(base))
+	defer plain.Close()
+	resp2, err := http.Get(plain.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	raw2, _ := io.ReadAll(resp2.Body)
+	if strings.Contains(string(raw2), "Spend by key") {
+		t.Fatal("no key card without keyed rows")
+	}
+}
+
+func TestShadowModeRollsUpWhatACapWouldHaveStopped(t *testing.T) {
+	base := seed.Generate(seed.Options{Events: 6, Seed: 21})
+	var evs []ledger.Event
+	for i, e := range base {
+		e.Dimensions = map[string]string{"status": "200", "request_id": "s" + strconv.Itoa(i)}
+		e.Tags.Run = "run-shadow"
+		e.CostUSD = 0.5
+		if i >= 3 { // three calls past the run's cap, served in shadow mode
+			e.Dimensions["would_refuse"] = "run reached the spend cap of $1.00"
+		}
+		if i == 5 { // one past a key's cap
+			e.Dimensions["would_refuse"] = "key …7788 reached its daily spend cap of $1.00 (resets at midnight UTC)"
+			e.Dimensions["key"] = "k-3fa9c2b1e0d4-7788"
+		}
+		e.DeriveID()
+		evs = append(evs, e)
+	}
+	srv := httptest.NewServer(New(evs))
+	defer srv.Close()
+	sum := getSummary(t, srv.URL, "/api/summary?days=all")
+	if sum.ShadowCalls != 3 || sum.ShadowSpendUSD < 1.49 || sum.ShadowSpendUSD > 1.51 || len(sum.ShadowLines) != 2 {
+		t.Fatalf("shadow rollup = %d %.2f %+v", sum.ShadowCalls, sum.ShadowSpendUSD, sum.ShadowLines)
+	}
+	if sum.ShadowLines[0].Who != "run-shadow" || sum.ShadowLines[0].Calls != 2 || sum.ShadowLines[1].Who != "key …7788" || sum.ShadowLines[1].Kind != "key" {
+		t.Fatalf("lines = %+v", sum.ShadowLines)
+	}
+	if sum.LoopsBlocked != 0 || len(sum.BlockedRuns) != 0 {
+		t.Fatal("nothing was refused")
+	}
+	resp, err := http.Get(srv.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "Shadow mode: what a cap would have stopped") || !strings.Contains(string(raw), "Would have been refused") || !strings.Contains(string(raw), "2 calls past the cap") {
+		t.Fatal("dashboard should show the shadow card and chip")
+	}
+	plain := httptest.NewServer(New(base))
+	defer plain.Close()
+	resp2, err := http.Get(plain.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	raw2, _ := io.ReadAll(resp2.Body)
+	if strings.Contains(string(raw2), "Shadow mode") {
+		t.Fatal("no shadow card without marked rows")
+	}
+	// The run page the card links to tells the same story: which calls a cap
+	// would have refused, where it would have tripped, and what they cost.
+	resp3, err := http.Get(srv.URL + "/run/run-shadow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	page, _ := io.ReadAll(resp3.Body)
+	for _, want := range []string{"would have been paused (shadow mode)", "CAP WOULD HAVE TRIPPED", "3 would have been refused", "Spent past the cap", "served, a cap would have refused it: run reached the spend cap of $1.00"} {
+		if !strings.Contains(string(page), want) {
+			t.Fatalf("run page missing %q", want)
+		}
+	}
+	if strings.Contains(string(page), "Prevented spend") || strings.Contains(string(page), "paused by the gateway") {
+		t.Fatal("a shadow-only run claims nothing it did not do")
 	}
 }

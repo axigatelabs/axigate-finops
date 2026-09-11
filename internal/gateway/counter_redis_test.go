@@ -129,16 +129,16 @@ func TestSharedCounterBoundsABurstAcrossReplicas(t *testing.T) {
 
 	// Two calls reserve the whole cap, one on each replica; the third, on
 	// either replica, is refused before it leaves.
-	if ok, _, where := a.admitWhere("r", false); !ok || counterLabel(where) != "shared" {
+	if ok, _, where := a.admitWhere("r", "", false); !ok || counterLabel(where) != "shared" {
 		t.Fatalf("first call on replica A should be admitted by the store: ok=%v where=%s", ok, where)
 	}
-	if ok, _, _ := b.admitWhere("r", false); !ok {
+	if ok, _, _ := b.admitWhere("r", "", false); !ok {
 		t.Fatal("second call on replica B should be admitted")
 	}
-	if ok, reason, _ := a.admitWhere("r", false); ok || reason != "run reached the spend cap of $0.10" {
+	if ok, reason, _ := a.admitWhere("r", "", false); ok || reason != "run reached the spend cap of $0.10" {
 		t.Fatalf("third call should be refused at the cap: ok=%v reason=%q", ok, reason)
 	}
-	if ok, reason, _ := b.admitWhere("r", false); ok || reason != "run reached the spend cap of $0.10" {
+	if ok, reason, _ := b.admitWhere("r", "", false); ok || reason != "run reached the spend cap of $0.10" {
 		t.Fatalf("the other replica sees the pause too: ok=%v reason=%q", ok, reason)
 	}
 	if n := al.wait(1); n != 1 {
@@ -158,7 +158,7 @@ func TestSharedCounterABurstWiderThanThePoolStaysOnTheStore(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok, _, where := s.admitWhere("wide", false)
+			ok, _, where := s.admitWhere("wide", "", false)
 			if ok {
 				atomic.AddInt32(&admitted, 1)
 			}
@@ -182,13 +182,13 @@ func TestSharedCounterSettlesPausesAndResumesWithAFreshBudget(t *testing.T) {
 	al := newAlertCounter()
 	s.setOnPause(al.hook)
 	for i := 0; i < 3; i++ { // $0.0075 each: the third crosses $0.02
-		ok, _, where := s.admitWhere("r", false)
+		ok, _, where := s.admitWhere("r", "", false)
 		if !ok {
 			t.Fatalf("call %d should be admitted", i+1)
 		}
-		s.record("r", 0.0075, false, where)
+		s.record("r", "", 0.0075, false, where)
 	}
-	if ok, reason, _ := s.admitWhere("r", false); ok || reason != "run reached the spend cap of $0.02" {
+	if ok, reason, _ := s.admitWhere("r", "", false); ok || reason != "run reached the spend cap of $0.02" {
 		t.Fatalf("fourth call should be refused: ok=%v reason=%q", ok, reason)
 	}
 	st := s.status()
@@ -204,7 +204,7 @@ func TestSharedCounterSettlesPausesAndResumesWithAFreshBudget(t *testing.T) {
 	if s.resumeRun("r") {
 		t.Fatal("a second resume finds nothing paused")
 	}
-	if ok, _, _ := s.admitWhere("r", false); !ok {
+	if ok, _, _ := s.admitWhere("r", "", false); !ok {
 		t.Fatal("a resumed run gets a fresh budget")
 	}
 	if len(s.status().PausedRuns) != 0 {
@@ -215,9 +215,9 @@ func TestSharedCounterSettlesPausesAndResumesWithAFreshBudget(t *testing.T) {
 	}
 	// The paused set expires with the runs, so it cannot grow forever; a
 	// refused call refreshes it too.
-	_, _, w := s.admitWhere("q", false)
-	s.record("q", 0.05, false, w)
-	s.admitWhere("q", false)
+	_, _, w := s.admitWhere("q", "", false)
+	s.record("q", "", 0.05, false, w)
+	s.admitWhere("q", "", false)
 	ttl, _ := s.client.do("TTL", s.pausedKey())
 	if n, _ := asInt(ttl); n <= 0 {
 		t.Fatalf("paused set should carry an expiry, TTL=%d", n)
@@ -226,11 +226,11 @@ func TestSharedCounterSettlesPausesAndResumesWithAFreshBudget(t *testing.T) {
 
 func TestSharedCounterEveryRunKeyExpiresEvenWithoutTags(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 5}, testPrefix(t))
-	_, _, w := s.admitWhere("untagged", false) // no noteRun: nothing but the reservation is written
+	_, _, w := s.admitWhere("untagged", "", false) // no noteRun: nothing but the reservation is written
 	if ttl, _ := s.client.do("TTL", s.runKey("untagged")); func() bool { n, _ := asInt(ttl); return n <= 0 }() {
 		t.Fatalf("a run key must expire after a bare admit, TTL=%v", ttl)
 	}
-	s.release("untagged", w)
+	s.release("untagged", "", w)
 	if ttl, _ := s.client.do("TTL", s.runKey("untagged")); func() bool { n, _ := asInt(ttl); return n <= 0 }() {
 		t.Fatalf("a run key must still expire after a release, TTL=%v", ttl)
 	}
@@ -238,17 +238,17 @@ func TestSharedCounterEveryRunKeyExpiresEvenWithoutTags(t *testing.T) {
 
 func TestSharedCounterSettlementsRunOncePerToken(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 10}, testPrefix(t))
-	_, _, w := s.admitWhere("tok", false)
-	s.record("tok", 0.10, false, w)
-	s.record("tok", 0.10, false, w) // a retry of the same settlement
+	_, _, w := s.admitWhere("tok", "", false)
+	s.record("tok", "", 0.10, false, w)
+	s.record("tok", "", 0.10, false, w) // a retry of the same settlement
 	h, _ := s.client.do("HMGET", s.runKey("tok"), "inflight", "calls", "spend")
 	f := h.([]any)
 	if asString(f[0]) != "0" || asString(f[1]) != "1" || asString(f[2]) != "100000" {
 		t.Fatalf("a repeated settlement must not count twice: inflight=%v calls=%v spend=%v", f[0], f[1], f[2])
 	}
-	_, _, w2 := s.admitWhere("tok", false)
-	s.release("tok", w2)
-	s.release("tok", w2)
+	_, _, w2 := s.admitWhere("tok", "", false)
+	s.release("tok", "", w2)
+	s.release("tok", "", w2)
 	h, _ = s.client.do("HGET", s.runKey("tok"), "inflight")
 	if asString(h) != "0" {
 		t.Fatalf("a repeated release must not decrement twice: inflight=%v", h)
@@ -259,12 +259,12 @@ func TestSharedCounterMeetsTheCapAtExactEqualityLikeTheInMemoryCounter(t *testin
 	s := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.80}, testPrefix(t))
 	m := newController(ControlPolicy{MaxSpendUSDPerRun: 0.80, Now: fixed()})
 	for _, c := range []float64{0.7, 0.1} {
-		_, _, w := s.admitWhere("eq", false)
-		s.record("eq", c, false, w)
+		_, _, w := s.admitWhere("eq", "", false)
+		s.record("eq", "", c, false, w)
 		m.admit("eq", false)
 		m.record("eq", c, false)
 	}
-	okS, _, _ := s.admitWhere("eq", false)
+	okS, _, _ := s.admitWhere("eq", "", false)
 	okM, _ := m.admit("eq", false)
 	if okS || okM {
 		t.Fatalf("both counters should refuse at exactly the cap: shared=%v memory=%v", okS, okM)
@@ -276,42 +276,42 @@ func TestSharedCounterCallCapInlineCapBypassAndKill(t *testing.T) {
 	a := newTestShared(t, ControlPolicy{MaxCallsPerRun: 2, MaxSpendUSDPerRun: 1.00, AdminToken: "tok"}, prefix)
 	b := newTestShared(t, ControlPolicy{MaxCallsPerRun: 2, MaxSpendUSDPerRun: 1.00, AdminToken: "tok"}, prefix)
 
-	a.admitWhere("calls", false)
-	b.admitWhere("calls", false)
-	if ok, reason, _ := a.admitWhere("calls", false); ok || reason != "run reached the call cap of 2" {
+	a.admitWhere("calls", "", false)
+	b.admitWhere("calls", "", false)
+	if ok, reason, _ := a.admitWhere("calls", "", false); ok || reason != "run reached the call cap of 2" {
 		t.Fatalf("call cap counts reservations: ok=%v reason=%q", ok, reason)
 	}
 	a.setRunCap("inline", 0.01)
-	_, _, w := b.admitWhere("inline", false)
-	b.record("inline", 0.02, false, w)
-	if ok, reason, _ := a.admitWhere("inline", false); ok || reason != "run reached the spend cap of $0.01" {
+	_, _, w := b.admitWhere("inline", "", false)
+	b.record("inline", "", 0.02, false, w)
+	if ok, reason, _ := a.admitWhere("inline", "", false); ok || reason != "run reached the spend cap of $0.01" {
 		t.Fatalf("inline cap binds on any replica: ok=%v reason=%q", ok, reason)
 	}
-	if ok, _, _ := b.admitWhere("inline", true); !ok {
+	if ok, _, _ := b.admitWhere("inline", "", true); !ok {
 		t.Fatal("bypass should pass a paused run")
 	}
 	a.setKilled(true)
-	if ok, reason, _ := b.admitWhere("fresh", false); ok || reason != "kill switch engaged" {
+	if ok, reason, _ := b.admitWhere("fresh", "", false); ok || reason != "kill switch engaged" {
 		t.Fatalf("kill is cluster-wide: ok=%v reason=%q", ok, reason)
 	}
-	if ok, _, _ := b.admitWhere("", false); ok {
+	if ok, _, _ := b.admitWhere("", "", false); ok {
 		t.Fatal("kill refuses untagged calls too")
 	}
 	if b.status().Killed != 1 {
 		t.Fatal("status should show the kill switch")
 	}
 	a.setKilled(false)
-	if ok, _, _ := b.admitWhere("fresh", false); !ok {
+	if ok, _, _ := b.admitWhere("fresh", "", false); !ok {
 		t.Fatal("clearing the kill switch admits again")
 	}
 }
 
 func TestSharedCounterReleaseKeepsInFlightHonest(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 2}, testPrefix(t))
-	_, _, w := s.admitWhere("r", false)
-	s.release("r", w) // the call never left; its reservation is returned
-	s.admitWhere("r", false)
-	if ok, _, _ := s.admitWhere("r", false); !ok {
+	_, _, w := s.admitWhere("r", "", false)
+	s.release("r", "", w) // the call never left; its reservation is returned
+	s.admitWhere("r", "", false)
+	if ok, _, _ := s.admitWhere("r", "", false); !ok {
 		t.Fatal("after a release, two calls should still fit under a cap of 2")
 	}
 }
@@ -327,12 +327,12 @@ func TestSharedCounterFallsBackPerProcessWhenTheStoreIsDown(t *testing.T) {
 	if s.mode() != "local" {
 		t.Fatalf("a store that is down at boot means local decisions, got %q", s.mode())
 	}
-	ok, _, where := s.admitWhere("r", false)
+	ok, _, where := s.admitWhere("r", "", false)
 	if !ok || where != "local" {
 		t.Fatalf("local fallback admits under the cap and says so: ok=%v where=%s", ok, where)
 	}
-	s.record("r", 0.02, false, where)
-	if ok, reason, _ := s.admitWhere("r", false); ok || reason != "run reached the spend cap of $0.01" {
+	s.record("r", "", 0.02, false, where)
+	if ok, reason, _ := s.admitWhere("r", "", false); ok || reason != "run reached the spend cap of $0.01" {
 		t.Fatalf("local fallback refuses at the cap: ok=%v reason=%q", ok, reason)
 	}
 	st := s.status()
@@ -368,7 +368,7 @@ func TestSharedCounterAnErrorOnOneKeyDecidesOneCallNotTheCounter(t *testing.T) {
 	if _, err := s.client.do("SET", s.runKey("clash"), "not-a-hash"); err != nil {
 		t.Fatal(err)
 	}
-	ok, _, where := s.admitWhere("clash", false)
+	ok, _, where := s.admitWhere("clash", "", false)
 	if !ok || where != "local" || s.mode() != "shared" {
 		t.Fatalf("one bad key decides that call locally and leaves the counter on the store: ok=%v where=%s mode=%s", ok, where, s.mode())
 	}
@@ -417,9 +417,9 @@ func TestSharedCounterKillSwitchSurvivesAGapInEveryDirection(t *testing.T) {
 
 	// (1) Engaged in the store before a gap: the fallback honours it.
 	a.setKilled(true)
-	b.admitWhere("x", false) // b learns the store's state
+	b.admitWhere("x", "", false) // b learns the store's state
 	simulateGap(b)
-	if ok, reason, _ := b.admitWhere("x", false); ok || reason != "kill switch engaged" {
+	if ok, reason, _ := b.admitWhere("x", "", false); ok || reason != "kill switch engaged" {
 		t.Fatalf("a kill known before the gap must hold during it: ok=%v reason=%q", ok, reason)
 	}
 	b.recovered()
@@ -428,21 +428,21 @@ func TestSharedCounterKillSwitchSurvivesAGapInEveryDirection(t *testing.T) {
 	// (2) Engaged during a gap: written back on recovery, so the other replica refuses.
 	simulateGap(a)
 	a.setKilled(true)
-	if ok, _, _ := a.admitWhere("y", false); ok {
+	if ok, _, _ := a.admitWhere("y", "", false); ok {
 		t.Fatal("kill during the gap refuses locally")
 	}
 	a.recovered()
 	if a.mode() != "shared" {
 		t.Fatal("a should have recovered")
 	}
-	if ok, reason, _ := b.admitWhere("y", false); ok || reason != "kill switch engaged" {
+	if ok, reason, _ := b.admitWhere("y", "", false); ok || reason != "kill switch engaged" {
 		t.Fatalf("a kill engaged in a gap must reach the store: ok=%v reason=%q", ok, reason)
 	}
 	// (3) Cleared during a gap: the store's copy is cleared on recovery.
 	simulateGap(a)
 	a.setKilled(false)
 	a.recovered()
-	if ok, _, _ := b.admitWhere("z", false); !ok {
+	if ok, _, _ := b.admitWhere("z", "", false); !ok {
 		t.Fatal("clearing the kill in a gap must reach the store")
 	}
 	if a.status().Killed != 0 {
@@ -450,14 +450,14 @@ func TestSharedCounterKillSwitchSurvivesAGapInEveryDirection(t *testing.T) {
 	}
 	// (4) Engaged on ANOTHER replica while this one is in a gap: this one's
 	// recovery must not clear it, and must learn it.
-	a.admitWhere("w", false) // a last saw: not killed
+	a.admitWhere("w", "", false) // a last saw: not killed
 	simulateGap(a)
 	b.setKilled(true)
 	a.recovered()
-	if ok, reason, _ := b.admitWhere("w", false); ok || reason != "kill switch engaged" {
+	if ok, reason, _ := b.admitWhere("w", "", false); ok || reason != "kill switch engaged" {
 		t.Fatalf("a replica recovering from a gap must not overwrite a kill it did not set: ok=%v reason=%q", ok, reason)
 	}
-	if ok, reason, _ := a.admitWhere("w", false); ok || reason != "kill switch engaged" {
+	if ok, reason, _ := a.admitWhere("w", "", false); ok || reason != "kill switch engaged" {
 		t.Fatalf("the recovering replica must learn the kill: ok=%v reason=%q", ok, reason)
 	}
 	b.setKilled(false)
@@ -468,12 +468,12 @@ func TestSharedCounterSettlesEachCallWhereItWasAdmitted(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 3, MaxSpendUSDPerRun: 1}, prefix)
 	// Admitted by the store, settled during a gap: owed and delivered on
 	// recovery, so no phantom reservation is left behind.
-	_, _, w := s.admitWhere("p", false)
+	_, _, w := s.admitWhere("p", "", false)
 	if counterLabel(w) != "shared" {
 		t.Fatal("expected the store to admit")
 	}
 	simulateGap(s)
-	s.record("p", 0.10, false, w)
+	s.record("p", "", 0.10, false, w)
 	if st := s.status(); st.Counter.Pending != 1 {
 		t.Fatalf("the settlement should be owed to the store: %+v", st.Counter)
 	}
@@ -486,12 +486,12 @@ func TestSharedCounterSettlesEachCallWhereItWasAdmitted(t *testing.T) {
 	// Admitted locally during a gap, settled after recovery: stays local, and
 	// the store's tally is untouched — that spend is not merged.
 	simulateGap(s)
-	_, _, w = s.admitWhere("q", false)
+	_, _, w = s.admitWhere("q", "", false)
 	if w != "local" {
 		t.Fatal("expected the fallback to admit")
 	}
 	s.recovered()
-	s.record("q", 0.42, false, w)
+	s.record("q", "", 0.42, false, w)
 	if v, _ := s.client.do("EXISTS", s.runKey("q")); v != int64(0) {
 		t.Fatal("a locally admitted call must not be recorded into the store")
 	}
@@ -501,21 +501,21 @@ func TestSharedCounterWritesBackLocalPausesAndResumesWhenTheStoreReturns(t *test
 	prefix := testPrefix(t)
 	s := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
 	other := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
-	_, _, w := s.admitWhere("old", false)
-	s.record("old", 0.05, false, w)
+	_, _, w := s.admitWhere("old", "", false)
+	s.record("old", "", 0.05, false, w)
 	simulateGap(s)
 	s.resumeRun("old") // remembered, delivered with the gap
-	_, _, w = s.admitWhere("blip", false)
-	s.record("blip", 0.05, false, w) // paused locally: owed to the store
-	waitOwed(t, s, 2)                // the pause hook runs on its own goroutine; 'u' + 'p'
+	_, _, w = s.admitWhere("blip", "", false)
+	s.record("blip", "", 0.05, false, w) // paused locally: owed to the store
+	waitOwed(t, s, 2)                    // the pause hook runs on its own goroutine; 'u' + 'p'
 	s.recovered()
 	if s.mode() != "shared" {
 		t.Fatalf("should have recovered, mode=%q", s.mode())
 	}
-	if ok, reason, _ := other.admitWhere("blip", false); ok || reason != "run reached the spend cap of $0.01" {
+	if ok, reason, _ := other.admitWhere("blip", "", false); ok || reason != "run reached the spend cap of $0.01" {
 		t.Fatalf("the gap's pause should be in the store: ok=%v reason=%q", ok, reason)
 	}
-	if ok, _, _ := other.admitWhere("old", false); !ok {
+	if ok, _, _ := other.admitWhere("old", "", false); !ok {
 		t.Fatal("the resume asked for during the gap should have reached the store")
 	}
 	if st := s.status(); st.Counter.Outages != 1 || st.Counter.LastOutage == "" || st.Counter.Pending != 0 {
@@ -525,11 +525,11 @@ func TestSharedCounterWritesBackLocalPausesAndResumesWhenTheStoreReturns(t *test
 
 func TestSharedCounterKeepsTheGapWhenWriteBackFailsAndDeliversOnlyOnce(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 10}, testPrefix(t))
-	_, _, w1 := s.admitWhere("good", false)
-	_, _, w2 := s.admitWhere("good", false)
+	_, _, w1 := s.admitWhere("good", "", false)
+	_, _, w2 := s.admitWhere("good", "", false)
 	simulateGap(s)
-	s.record("good", 0.10, false, w1)
-	s.record("good", 0.10, false, w2)
+	s.record("good", "", 0.10, false, w1)
+	s.record("good", "", 0.10, false, w2)
 	// The store "answers the ping" but the write-back fails: nothing is
 	// dropped, the gap continues.
 	good := s.client
@@ -550,13 +550,13 @@ func TestSharedCounterKeepsTheGapWhenWriteBackFailsAndDeliversOnlyOnce(t *testin
 
 func TestSharedCounterAnOwedItemTheStoreRefusesIsDroppedNotRetriedForever(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 10}, testPrefix(t))
-	_, _, w := s.admitWhere("fine", false)
+	_, _, w := s.admitWhere("fine", "", false)
 	simulateGap(s)
 	s.owe(owed{kind: 'r', run: "poison", token: "badtoken", costUSD: 0.10}) // a settlement for a run the store will refuse
 	if _, err := s.client.do("SET", s.runKey("poison"), "not-a-hash"); err != nil {
 		t.Fatal(err)
 	}
-	s.record("fine", 0.10, false, w)
+	s.record("fine", "", 0.10, false, w)
 	s.recovered()
 	if s.mode() != "shared" {
 		t.Fatal("one refused item must not pin the counter in the gap")
@@ -592,8 +592,8 @@ func TestSharedCounterOwedWorkIsDeliveredWhileHealthy(t *testing.T) {
 	if d := s.report().Delivered; d != 2 {
 		t.Fatalf("owed_delivered counts owed items only (the kill and the resume): %d", d)
 	}
-	_, _, w := s.admitWhere("plain", false)
-	s.record("plain", 0.01, false, w) // a healthy settlement is not an owed delivery
+	_, _, w := s.admitWhere("plain", "", false)
+	s.record("plain", "", 0.01, false, w) // a healthy settlement is not an owed delivery
 	if d := s.report().Delivered; d != 2 {
 		t.Fatalf("a healthy settlement must not count as an owed delivery: %d", d)
 	}
@@ -777,14 +777,14 @@ func TestSharedCounterResumeAfterAPauseInAGapLandsInOrder(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
 	other := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
 	simulateGap(s)
-	_, _, w := s.admitWhere("x", false)
-	s.record("x", 0.05, false, w) // the fallback pauses x
+	_, _, w := s.admitWhere("x", "", false)
+	s.record("x", "", 0.05, false, w) // the fallback pauses x
 	waitOwed(t, s, 1)
 	if !s.resumeRun("x") {
 		t.Fatal("the resume is accepted during the gap")
 	}
 	s.recovered()
-	if ok, reason, _ := other.admitWhere("x", false); !ok {
+	if ok, reason, _ := other.admitWhere("x", "", false); !ok {
 		t.Fatalf("the resume must be the last word in the store: refused with %q", reason)
 	}
 }
@@ -798,7 +798,7 @@ func TestSharedCounterAKillTheStoreHasNotTakenIsEnforcedHere(t *testing.T) {
 	s.killed, s.killDirty = true, true
 	s.local.setKilled(true)
 	s.mu.Unlock()
-	if ok, reason, where := s.admitWhere("r", false); ok || reason != "kill switch engaged" || where != "local" {
+	if ok, reason, where := s.admitWhere("r", "", false); ok || reason != "kill switch engaged" || where != "local" {
 		t.Fatalf("a pending kill must hold here: ok=%v reason=%q where=%s", ok, reason, where)
 	}
 	if !s.pending() || s.status().Killed != 1 {
@@ -806,7 +806,7 @@ func TestSharedCounterAKillTheStoreHasNotTakenIsEnforcedHere(t *testing.T) {
 	}
 	s.flush()
 	other := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 1}, prefix)
-	if ok, _, _ := other.admitWhere("r", false); ok {
+	if ok, _, _ := other.admitWhere("r", "", false); ok {
 		t.Fatal("the flush must land the kill in the store")
 	}
 	s.setKilled(false)
@@ -818,7 +818,7 @@ func TestSharedCounterErrorsOnOneKeyNeverSwitchTheCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
-		if _, _, where := s.admitWhere("clash", false); where != "local" {
+		if _, _, where := s.admitWhere("clash", "", false); where != "local" {
 			t.Fatalf("call %d on a bad key is decided locally", i+1)
 		}
 	}
@@ -832,13 +832,13 @@ func TestSharedCounterARunTheStorePausedStaysPausedDuringAGap(t *testing.T) {
 	prefix := testPrefix(t)
 	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
 	b := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01}, prefix)
-	_, _, w := a.admitWhere("x", false)
-	a.record("x", 0.05, false, w) // the store pauses x
-	if ok, _, _ := b.admitWhere("x", false); ok {
+	_, _, w := a.admitWhere("x", "", false)
+	a.record("x", "", 0.05, false, w) // the store pauses x
+	if ok, _, _ := b.admitWhere("x", "", false); ok {
 		t.Fatal("b should see the pause")
 	}
 	simulateGap(b)
-	if ok, reason, where := b.admitWhere("x", false); ok || where != "local" || reason == "" {
+	if ok, reason, where := b.admitWhere("x", "", false); ok || where != "local" || reason == "" {
 		t.Fatalf("the fallback must honour a pause it had seen: ok=%v reason=%q where=%s", ok, reason, where)
 	}
 }
@@ -846,8 +846,8 @@ func TestSharedCounterARunTheStorePausedStaysPausedDuringAGap(t *testing.T) {
 // Both the admit and the settlement run once per token even when retried.
 func TestSharedCounterAdmitAndSettlementTokensReplayOnce(t *testing.T) {
 	s := newTestShared(t, ControlPolicy{MaxCallsPerRun: 10}, testPrefix(t))
-	args := []string{"r", "0", "10", "0", "0", s.ttlArg(), "", "", "", "tok-1"}
-	keys := []string{s.runKey("r"), s.killKey(), s.pausedKey()}
+	args := append([]string{"r", "0", "10", "0", "0", s.ttlArg(), "", "", "", "tok-1", ""}, s.keyArgs()...)
+	keys := []string{s.runKey("r"), s.killKey(), s.pausedKey(), s.noneKey(), s.pausedKeysKey()}
 	if _, err := s.client.eval(luaAdmit, shaAdmit, keys, args...); err != nil {
 		t.Fatal(err)
 	}
@@ -861,8 +861,8 @@ func TestSharedCounterAdmitAndSettlementTokensReplayOnce(t *testing.T) {
 	if h, _ := s.client.do("HGET", s.runKey("r"), "inflight"); asString(h) != "1" {
 		t.Fatalf("a replayed admit must not reserve twice: inflight=%v", h)
 	}
-	s.record("r", 0.10, false, "shared:tok-1")
-	s.record("r", 0.10, false, "shared:tok-1")
+	s.record("r", "", 0.10, false, "shared:tok-1")
+	s.record("r", "", 0.10, false, "shared:tok-1")
 	h, _ := s.client.do("HMGET", s.runKey("r"), "inflight", "calls", "spend")
 	f := h.([]any)
 	if asString(f[0]) != "0" || asString(f[1]) != "1" || asString(f[2]) != "100000" {
@@ -893,9 +893,9 @@ func TestSharedCounterAPauseIsOwedBeforeItsCallReturns(t *testing.T) {
 	simulateGap(s)
 	for i := 0; i < 20; i++ {
 		run := "x" + strconv.Itoa(i)
-		_, _, w := s.admitWhere(run, false)
-		s.record(run, 0.05, false, w) // pauses, and owes the pause before returning
-		s.resumeRun(run)              // immediately: must land after the pause
+		_, _, w := s.admitWhere(run, "", false)
+		s.record(run, "", 0.05, false, w) // pauses, and owes the pause before returning
+		s.resumeRun(run)                  // immediately: must land after the pause
 	}
 	s.mu.Lock()
 	firstPause, firstResume := map[string]int{}, map[string]int{}
@@ -919,7 +919,7 @@ func TestSharedCounterAPauseIsOwedBeforeItsCallReturns(t *testing.T) {
 	}
 	s.recovered()
 	for i := 0; i < 20; i++ {
-		if ok, reason, _ := other.admitWhere("x"+strconv.Itoa(i), false); !ok {
+		if ok, reason, _ := other.admitWhere("x"+strconv.Itoa(i), "", false); !ok {
 			t.Fatalf("run x%d should be resumed in the store, got %q", i, reason)
 		}
 	}
@@ -931,17 +931,331 @@ func TestSharedCounterRemembersStorePausesAcrossBypassAndOwnSettlement(t *testin
 	prefix := testPrefix(t)
 	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01, AdminToken: "tok"}, prefix)
 	b := newTestShared(t, ControlPolicy{MaxSpendUSDPerRun: 0.01, AdminToken: "tok"}, prefix)
-	_, _, w := a.admitWhere("x", false)
-	a.record("x", 0.05, false, w) // a's own settlement pauses x in the store
+	_, _, w := a.admitWhere("x", "", false)
+	a.record("x", "", 0.05, false, w) // a's own settlement pauses x in the store
 	simulateGap(a)
-	if ok, _, _ := a.admitWhere("x", false); ok {
+	if ok, _, _ := a.admitWhere("x", "", false); ok {
 		t.Fatal("the gateway that stopped the run must remember it during a gap")
 	}
 	a.recovered()
-	b.admitWhere("x", false) // b learns the pause
-	b.admitWhere("x", true)  // a bypass passes, and must not forget it
+	b.admitWhere("x", "", false) // b learns the pause
+	b.admitWhere("x", "", true)  // a bypass passes, and must not forget it
 	simulateGap(b)
-	if ok, _, _ := b.admitWhere("x", false); ok {
+	if ok, _, _ := b.admitWhere("x", "", false); ok {
 		t.Fatal("a bypass must not erase the memory of a store pause")
+	}
+}
+
+// A leaked key spending across replicas hits its ceiling once, everywhere.
+func TestSharedCounterKeyCeilingHoldsAcrossReplicas(t *testing.T) {
+	prefix := testPrefix(t)
+	pol := ControlPolicy{MaxSpendUSDPerKeyDay: 0.02}
+	a := newTestShared(t, pol, prefix)
+	b := newTestShared(t, pol, prefix)
+	al := newAlertCounter()
+	a.setOnPause(al.hook)
+	b.setOnPause(al.hook)
+	a.noteKey("k-0123456789ab-9999", "thief", "", "gpt-4o")
+	_, _, w := a.admitWhere("r1", "k-0123456789ab-9999", false)
+	a.record("r1", "k-0123456789ab-9999", 0.0075, false, w)
+	_, _, w = b.admitWhere("r2", "k-0123456789ab-9999", false)
+	b.record("r2", "k-0123456789ab-9999", 0.0075, false, w)
+	_, _, w = a.admitWhere("r3", "k-0123456789ab-9999", false)
+	a.record("r3", "k-0123456789ab-9999", 0.0075, false, w) // $0.0225 crosses $0.02
+	if ok, reason, _ := b.admitWhere("r4", "k-0123456789ab-9999", false); ok || reason != "key …9999 reached its daily spend cap of $0.02 (resets at midnight UTC)" {
+		t.Fatalf("the other replica refuses the key: ok=%v reason=%q", ok, reason)
+	}
+	if n := al.wait(1); n != 1 || al.last().Key != "k-0123456789ab-9999" || al.last().Agent != "thief" {
+		t.Fatalf("one key alert with attribution, got %d: %+v", n, al.last())
+	}
+	st := a.status()
+	if len(st.PausedKeys) != 1 || st.PausedKeys[0].Key != "k-0123456789ab-9999" || st.PausedKeys[0].CallsToday != 3 {
+		t.Fatalf("status lists the paused key: %+v", st.PausedKeys)
+	}
+	if !a.resumeKey("k-0123456789ab-9999") {
+		t.Fatal("resume finds the key")
+	}
+	if ok, _, _ := b.admitWhere("r5", "k-0123456789ab-9999", false); !ok {
+		t.Fatal("a resumed key is admitted everywhere")
+	}
+	// A run cap and a key cap coexist: a run refused by its own cap does not touch the key.
+	if _, _, w := a.admitWhere("r6", "k-other-1111", false); counterLabel(w) != "shared" {
+		t.Fatal("another key admits")
+	}
+}
+
+// A key paused by the fallback during a gap is written back, and a key the
+// store had paused stays paused for the fallback.
+func TestSharedCounterKeyPausesSurviveAGap(t *testing.T) {
+	prefix := testPrefix(t)
+	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerKey: 0.01}, prefix)
+	b := newTestShared(t, ControlPolicy{MaxSpendUSDPerKey: 0.01}, prefix)
+	simulateGap(a)
+	_, _, w := a.admitWhere("r1", "k-0123456789ab-2222", false)
+	a.record("r1", "k-0123456789ab-2222", 0.05, false, w) // the fallback pauses the key
+	waitOwed(t, a, 1)
+	a.recovered()
+	if ok, reason, _ := b.admitWhere("r2", "k-0123456789ab-2222", false); ok || !strings.Contains(reason, "key …2222") {
+		t.Fatalf("the gap's key pause must be in the store: ok=%v reason=%q", ok, reason)
+	}
+	// b saw the pause; during b's own gap it still refuses the key.
+	simulateGap(b)
+	if ok, _, where := b.admitWhere("r3", "k-0123456789ab-2222", false); ok || where != "local" {
+		t.Fatalf("the fallback honours a key pause it had seen: ok=%v where=%s", ok, where)
+	}
+}
+
+func redisInt(t *testing.T, c *respClient, cmd, key string) int64 {
+	t.Helper()
+	v, err := c.do(cmd, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := asInt(v)
+	return n
+}
+
+// Untagged keyed calls keep their per-call ids out of the key's 400-day
+// hash: the tallies stay a handful of fields, the ids live as long as a run.
+func TestSharedCounterUntaggedKeyedCallsDoNotGrowTheKeyHash(t *testing.T) {
+	prefix := testPrefix(t)
+	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 100}, prefix)
+	c := redisUp(t)
+	for i := 0; i < 20; i++ {
+		_, _, w := a.admitWhere("", "k-plain-1111", false)
+		if i%2 == 0 {
+			a.record("", "k-plain-1111", 0.001, false, w)
+		} else {
+			a.release("", "k-plain-1111", w)
+		}
+	}
+	if n := redisInt(t, c, "HLEN", prefix+"key:k-plain-1111"); n > 12 {
+		t.Fatalf("the key hash holds tallies only, got %d fields", n)
+	}
+	bucket := prefix + "keytok:k-plain-1111:" + a.policy.Now().UTC().Format("20060102")
+	if n := redisInt(t, c, "HLEN", bucket); n != 40 {
+		t.Fatalf("every admit and settle left its id in today's bucket: %d", n)
+	}
+	if ttl := redisInt(t, c, "TTL", bucket); ttl <= 0 || ttl > 3*24*3600 {
+		t.Fatalf("a bucket dies three days after its day starts, ttl=%d", ttl)
+	}
+	// A settle that lands the next day still finds its bucket, and the
+	// bucket's clock keeps running down rather than being refreshed.
+	later := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 100, Now: func() time.Time { return a.policy.Now().Add(24 * time.Hour) }}, prefix)
+	_, _, w := a.admitWhere("", "k-plain-1111", false)
+	later.record("", "k-plain-1111", 0.001, false, w)
+	if n := redisInt(t, c, "HLEN", bucket); n != 42 {
+		t.Fatalf("the next-day settle joined its admit's bucket: %d", n)
+	}
+	if ttl := redisInt(t, c, "TTL", bucket); ttl > 2*24*3600 {
+		t.Fatalf("a touch only shortens a bucket's life, ttl=%d", ttl)
+	}
+	if ttl := redisInt(t, c, "TTL", prefix+"key:k-plain-1111"); ttl <= 48*3600 {
+		t.Fatalf("the tally hash keeps its long life, ttl=%d", ttl)
+	}
+}
+
+// A replica whose clock lags never resets the store's day: the day only
+// moves forward, so a tally and a daily pause survive a lagging replica.
+func TestSharedCounterLaggingClockNeverResetsTheDay(t *testing.T) {
+	prefix := testPrefix(t)
+	today := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 0.02, Now: func() time.Time { return today }}, prefix)
+	b := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 0.02, Now: func() time.Time { return today.Add(-24 * time.Hour) }}, prefix)
+	for i, s := range []*sharedCounter{a, b, a} {
+		ok, _, w := s.admitWhere("r", "k-0123456789ab-3333", false)
+		if !ok {
+			t.Fatalf("call %d admits", i+1)
+		}
+		s.record("r", "k-0123456789ab-3333", 0.0075, false, w) // $0.0225 on one store day: paused on the third
+	}
+	if ok, _, _ := b.admitWhere("r", "k-0123456789ab-3333", false); ok {
+		t.Fatal("the lagging replica must neither reset the tally nor clear the pause")
+	}
+	if ok, _, _ := a.admitWhere("r", "k-0123456789ab-3333", false); ok {
+		t.Fatal("the pause holds for the replica on the right day")
+	}
+	if st := b.status(); len(st.PausedKeys) != 1 {
+		t.Fatalf("the lagging replica still lists the pause: %+v", st.PausedKeys)
+	}
+}
+
+// A daily pause the fallback made during a gap is written back as a daily
+// pause, so the store still clears it at midnight.
+func TestSharedCounterGapDayPauseClearsAtMidnight(t *testing.T) {
+	prefix := testPrefix(t)
+	now := time.Date(2026, 9, 11, 23, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	pol := ControlPolicy{MaxSpendUSDPerKeyDay: 0.01, MaxSpendUSDPerKey: 1, Now: clock}
+	a := newTestShared(t, pol, prefix)
+	b := newTestShared(t, pol, prefix)
+	simulateGap(a)
+	_, _, w := a.admitWhere("r1", "k-0123456789ab-4444", false)
+	a.record("r1", "k-0123456789ab-4444", 0.05, false, w) // the fallback day-pauses the key
+	waitOwed(t, a, 1)
+	a.recovered()
+	if ok, reason, _ := b.admitWhere("r2", "k-0123456789ab-4444", false); ok || !strings.Contains(reason, "resets at midnight") {
+		t.Fatalf("the gap's daily pause is in the store as a daily pause: ok=%v reason=%q", ok, reason)
+	}
+	now = now.Add(2 * time.Hour)
+	if ok, _, _ := b.admitWhere("r3", "k-0123456789ab-4444", false); !ok {
+		t.Fatal("a daily pause written back from a gap still clears at midnight")
+	}
+}
+
+// On a healthy store the total cap holds at admit and at record, survives
+// midnight, and a resume after a daily pause keeps the total.
+func TestSharedCounterKeyTotalCapOnAHealthyStore(t *testing.T) {
+	prefix := testPrefix(t)
+	now := time.Date(2026, 9, 11, 23, 0, 0, 0, time.UTC)
+	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 0.05, MaxSpendUSDPerKey: 0.06, Now: func() time.Time { return now }}, prefix)
+	al := newAlertCounter()
+	a.setOnPause(al.hook)
+	spend := func(run string, n int) {
+		for i := 0; i < n; i++ {
+			ok, _, w := a.admitWhere(run, "k-0123456789ab-5555", false)
+			if !ok {
+				return
+			}
+			a.record(run, "k-0123456789ab-5555", 0.0075, false, w)
+		}
+	}
+	spend("r1", 7) // $0.0525 today: the daily cap pauses at record
+	if ok, reason, _ := a.admitWhere("r2", "k-0123456789ab-5555", false); ok || !strings.Contains(reason, "daily") {
+		t.Fatalf("daily pause: ok=%v reason=%q", ok, reason)
+	}
+	if n := al.wait(1); n != 1 || !al.last().dayPause || al.last().Calls != 7 {
+		t.Fatalf("one daily alert with today's figures, got %d: %+v", n, al.last())
+	}
+	if !a.resumeKey("k-0123456789ab-5555") {
+		t.Fatal("resume finds the key")
+	}
+	spend("r3", 1) // $0.06 total: the total cap fires, the daily resume did not wipe it
+	if ok, reason, _ := a.admitWhere("r4", "k-0123456789ab-5555", false); ok || reason != "key …5555 reached its spend cap of $0.06" {
+		t.Fatalf("total pause: ok=%v reason=%q", ok, reason)
+	}
+	now = now.Add(2 * time.Hour) // midnight: a total pause stays
+	if ok, _, _ := a.admitWhere("r5", "k-0123456789ab-5555", false); ok {
+		t.Fatal("a total pause does not clear with the day")
+	}
+	if st := a.status(); len(st.PausedKeys) != 1 || st.PausedKeys[0].TotalUSD < 0.06 || st.PausedKeys[0].CallsToday != 0 {
+		t.Fatalf("status shows the total and today's fresh figures: %+v", st.PausedKeys)
+	}
+	a.resumeKey("k-0123456789ab-5555")
+	if ok, _, _ := a.admitWhere("r6", "k-0123456789ab-5555", false); !ok {
+		t.Fatal("a resume after a total pause grants a fresh total")
+	}
+	if n := al.wait(2); n != 2 {
+		t.Fatalf("one alert per key stop, got %d", n)
+	}
+}
+
+// A refusal because the run is paused still gives a new key's hash its expiry.
+func TestSharedCounterRunPausedRefusalExpiresTheKeyHash(t *testing.T) {
+	prefix := testPrefix(t)
+	a := newTestShared(t, ControlPolicy{MaxCallsPerRun: 1, MaxSpendUSDPerKeyDay: 1}, prefix)
+	_, _, w := a.admitWhere("r1", "k-one-6666", false)
+	a.record("r1", "k-one-6666", 0.001, false, w) // the run is paused at one call
+	if ok, _, _ := a.admitWhere("r1", "k-new-7777", false); ok {
+		t.Fatal("the run is paused")
+	}
+	if ttl := redisInt(t, redisUp(t), "TTL", prefix+"key:k-new-7777"); ttl <= 0 {
+		t.Fatalf("a key hash created on a refused call must expire, ttl=%d", ttl)
+	}
+}
+
+// A run refused because its key is paused still gets its hash an expiry.
+func TestSharedCounterKeyPausedRefusalExpiresTheRunHash(t *testing.T) {
+	prefix := testPrefix(t)
+	a := newTestShared(t, ControlPolicy{MaxSpendUSDPerKeyDay: 0.01}, prefix)
+	_, _, w := a.admitWhere("r1", "k-0123456789ab-8888", false)
+	a.record("r1", "k-0123456789ab-8888", 0.05, false, w) // the key is paused
+	a.noteRun("r-fresh", "agent", "", "gpt-4o")
+	if ok, _, _ := a.admitWhere("r-fresh", "k-0123456789ab-8888", false); ok {
+		t.Fatal("the key is paused")
+	}
+	if ttl := redisInt(t, redisUp(t), "TTL", prefix+"run:r-fresh"); ttl <= 0 {
+		t.Fatalf("a run hash created on a key refusal must expire, ttl=%d", ttl)
+	}
+}
+
+// A daily pause the fallback made yesterday is over by the time it is
+// written back today: it is not resurrected in the store, and a note of it
+// does not seed a fallback built today.
+func TestSharedCounterStaleDayPauseIsNotResurrected(t *testing.T) {
+	prefix := testPrefix(t)
+	now := time.Date(2026, 9, 11, 23, 30, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	pol := ControlPolicy{MaxSpendUSDPerKeyDay: 0.01, Now: clock}
+	a := newTestShared(t, pol, prefix)
+	b := newTestShared(t, pol, prefix)
+	// b sees the store pause the key tonight, then a gap spans midnight.
+	_, _, w := b.admitWhere("r0", "k-0123456789ab-6666", false)
+	b.record("r0", "k-0123456789ab-6666", 0.05, false, w)
+	if ok, _, _ := b.admitWhere("r1", "k-0123456789ab-6666", false); ok {
+		t.Fatal("paused tonight")
+	}
+	simulateGap(a)
+	_, _, w = a.admitWhere("r2", "k-0123456789ab-6666", false)
+	a.record("r2", "k-0123456789ab-6666", 0.05, false, w) // the fallback day-pauses it too
+	waitOwed(t, a, 1)
+	now = now.Add(time.Hour) // midnight passed before the store came back
+	a.recovered()
+	if ok, _, where := b.admitWhere("r3", "k-0123456789ab-6666", false); !ok || where == "local" {
+		t.Fatalf("yesterday's daily pause, written back today, must not refuse today: ok=%v where=%s", ok, where)
+	}
+	simulateGap(b) // b remembered last night's pause; a fallback built today must not honour it
+	if ok, _, where := b.admitWhere("r4", "k-0123456789ab-6666", false); !ok || where != "local" {
+		t.Fatalf("a stale note does not seed the fallback: ok=%v where=%s", ok, where)
+	}
+}
+
+// Shadow mode on the store: the replica in shadow serves a capped run with
+// the reason and alerts once; the state is shared, so a replica that
+// enforces refuses that run; a gap keeps the same manners.
+func TestSharedCounterShadowModeServesWithReasonAndSharesTheState(t *testing.T) {
+	prefix := testPrefix(t)
+	watch := newTestShared(t, ControlPolicy{MaxCallsPerRun: 2, MaxSpendUSDPerKeyDay: 0.01, Shadow: true}, prefix)
+	enforce := newTestShared(t, ControlPolicy{MaxCallsPerRun: 2, MaxSpendUSDPerKeyDay: 0.01}, prefix)
+	al := newAlertCounter()
+	watch.setOnPause(al.hook)
+	enforce.setOnPause(al.hook)
+	for i := 0; i < 2; i++ {
+		ok, reason, w := watch.admitWhere("r1", "", false)
+		if !ok || reason != "" {
+			t.Fatalf("call %d under the cap: ok=%v reason=%q", i+1, ok, reason)
+		}
+		watch.record("r1", "", 0.001, false, w)
+	}
+	ok, reason, w := watch.admitWhere("r1", "", false)
+	if !ok || reason != "run reached the call cap of 2" || counterLabel(w) != "shared" {
+		t.Fatalf("shadow serves with the reason: ok=%v reason=%q where=%s", ok, reason, w)
+	}
+	watch.record("r1", "", 0.001, false, w)
+	if n := al.wait(1); n != 1 || !al.last().Shadow {
+		t.Fatalf("one shadow alert, got %d: %+v", n, al.last())
+	}
+	if ok, _, _ := enforce.admitWhere("r1", "", false); ok {
+		t.Fatal("the pause is shared: a replica that enforces refuses the run")
+	}
+	if st := watch.status(); len(st.PausedRuns) != 1 || st.PausedRuns[0].Run != "r1" || !st.Policy.Shadow || !strings.Contains(st.Note, "marked, not refused") {
+		t.Fatalf("status lists the marked run, the mode and the note: %+v", st)
+	}
+	if st := enforce.status(); st.Policy.Shadow || st.Note != "" {
+		t.Fatalf("the enforcing replica reports its own mode: %+v", st)
+	}
+	// A key past its cap: served with the key's reason, once alerted.
+	_, _, w = watch.admitWhere("", "k-0123456789ab-2468", false)
+	watch.record("", "k-0123456789ab-2468", 0.05, false, w)
+	if ok, reason, _ := watch.admitWhere("", "k-0123456789ab-2468", false); !ok || !strings.HasPrefix(reason, "key …2468 reached its daily spend cap") {
+		t.Fatalf("shadow serves a capped key with its reason: ok=%v reason=%q", ok, reason)
+	}
+	if n := al.wait(2); n != 2 {
+		t.Fatalf("one alert per stop, got %d", n)
+	}
+	// In a gap the fallback keeps the same manners.
+	simulateGap(watch)
+	if ok, reason, where := watch.admitWhere("r1", "", false); !ok || reason == "" || where != "local" {
+		t.Fatalf("the fallback serves and marks too: ok=%v reason=%q where=%s", ok, reason, where)
 	}
 }

@@ -175,7 +175,8 @@ the FOCUS export, no tiers, no account, no upgrade.
   pause a run so its next call is refused. A global kill switch and a bypass
   credential are available through a token-guarded admin endpoint. Loops are
   keyed to the caller's explicit run id; a request with no run id is never
-  flagged, because a loop is never inferred.
+  flagged, because a loop is never inferred. `--shadow` serves every call and
+  only marks what a cap would have refused, for watching before enforcing.
 - **Attribution.** Every call carries the team/project/customer/agent/run tags
   you set, so cost lands on the owner that caused it. Spend on unmapped ids is
   shown as *unknown*, never guessed.
@@ -243,10 +244,78 @@ the line under both `text` and `content`), so it lands in your channel:
 > refused.
 
 Anything else gets the structured fields too (`event`, `run`, `agent`, `team`,
-`model`, `reason`, `calls`, `spend_usd`, `at`). It fires once per stop, not once
-per refused call, and it is fail-open: a slow or dead webhook is logged and
-dropped, never allowed to touch a request. `AXIGATE_STOP_ALERT_URL` works in
-place of the flag.
+`model`, `reason`, `calls`, `spend_usd`, `at`; a key stop adds `key`). It fires
+once per stop, not once per refused call, and it is fail-open: a slow or dead
+webhook is logged and dropped, never allowed to touch a request.
+`AXIGATE_STOP_ALERT_URL` works in place of the flag. In shadow mode (below)
+the event is `run_flagged` or `key_flagged` and the body carries
+`"shadow": true`, so a consumer can tell a mark from a stop.
+
+## Cap a key, not just a run
+
+Two of the biggest AI bills written up in 2026 came from stolen keys, not
+loops — one of them around $600k. A run cap cannot help with that: the spend
+is spread over many fresh runs. A key cap can, for every call that reaches
+the gateway — a key an internal agent or CI job is burning across runs, or a
+leaked key on a network where only the gateway can reach the provider:
+
+```bash
+axigate-finops gateway --provider openai \
+  --max-spend-per-key-day 50 --max-spend-per-key 500
+```
+
+Every call carries the key that pays for it. The gateway keeps a fingerprint
+of that key — never the key itself — and tallies spend per key across every
+run it starts, counted against the key before the call leaves, the way a run
+is. A key at its daily cap is refused (`429`, naming the key by its last four
+characters) until midnight UTC; a key at its total cap is refused until an
+operator resumes it, which needs `--admin-token`:
+
+```bash
+# the gateway was started with --admin-token <token>
+curl -X POST "http://localhost:8787/_axigate/keys/resume?key=k-3fa9c2b1e0d4-7788" \
+  -H "X-AxiGate-Admin: <token>"
+```
+
+The stop alert fires once per key stop, with the agent and team that were
+using it. The dashboard's **Spend by key** card shows what each key spent and
+how often it was refused; a refused count on a key you do not recognise is the
+first sign of a leak. Label a key with an `X-AxiGate-Key: ci-runner` header
+and the dashboard shows that name next to the fingerprint; the ceiling still
+binds to the credential itself, so whoever holds a key cannot dodge it by
+renaming. Resuming after a daily pause keeps the total; resuming after a
+total pause grants a fresh one. The fingerprint is all the ledger ever sees;
+the key itself goes to the provider and nowhere else. A real provider key
+cannot be recovered from its fingerprint; a short or guessable token (the
+`--api-key` you give a self-hosted model server) could be, by guessing,
+and one shorter than eight characters gets no visible suffix at all. With
+`--shared-counter` the key's tally is shared across replicas, so a leaked key
+meets its ceiling once, everywhere. It cannot stop someone calling the
+provider directly with your raw key — set the provider's own spending limit
+for that.
+
+## Watch before you enforce
+
+Nobody turns a cap on for real traffic on day one. Start with `--shadow`:
+
+```bash
+axigate-finops gateway --provider openai --max-spend-per-run 5 --shadow
+```
+
+Every call is served. The ones a cap would have refused are marked on the
+row (`would_refuse`, with the reason), the dashboard shows what a cap would
+have stopped and what those calls actually cost, and the stop alert still
+arrives — worded "would have stopped", so nobody mistakes it for a real stop.
+The tallies, pauses and resumes work the same way they would in earnest; only
+the refusal is withheld, so a marked run keeps spending and its tally keeps
+climbing. The alert fires once, when the cap trips, with the figures at that
+moment; what the run spent after that is only on the dashboard. The kill
+switch still refuses. Every replica sharing a `--shared-counter` store should
+run with the same `--shadow` setting: the mark is shared, the choice to refuse
+is each gateway's own. When the week's picture looks right, start the gateway
+without `--shadow`: with `--shared-counter` a run or key already past its cap
+is refused from the restart on; without it the tallies start again from zero,
+and a run or key is refused when it reaches its cap again.
 
 ## Caps across gateway replicas
 
@@ -267,7 +336,13 @@ engaged across gateway restarts, for as long as the store keeps its data,
 until it is cleared. Nothing but run ids, counts, dollars, the attribution
 tags, why a run was paused, the kill switch and an id per call (kept with the
 run, so a retried write counts once) is stored. A run is remembered for two
-days of silence, its pause included. One Redis, not Redis Cluster.
+days of silence, its pause included. Without a key cap the store never sees a
+key. With one, each key's fingerprint, its daily and total tallies and any
+pause are kept for four hundred days, so a total cap means what it says — and
+a key at its total cap stays paused across restarts, which is why that flag
+needs `--admin-token` alongside the store; the per-call ids of keyed calls
+that carry no run id are kept until three days after the start of the UTC day
+they were made on. One Redis, not Redis Cluster.
 `rediss://` turns on TLS; a password goes in the URL, which anyone who can
 list processes on that host can read.
 
@@ -301,6 +376,14 @@ made on another replica during the gap is seen when the store returns.
   early) settles at no cost so the run keeps moving, and is counted on the
   dashboard as a call with unknown cost — not as a free one. The provider's
   bill is what fills it in.
+- In shadow mode the alert fires once per run or key, when its cap trips, and
+  the run keeps spending after it; the dashboard is where the rest shows. The
+  admin status endpoint lists marked runs and keys under `paused_runs` and
+  `paused_keys` with a note saying they are marked, not refused.
+- A key cap governs the calls that reach the gateway, not a key used directly
+  against the provider. Without `--shared-counter` the total is per process
+  and resets with a restart; with it, a key at its total cap stays paused until
+  an operator resumes it through the admin endpoint.
 - A provider export shows spend, cache use and spikes, but not loops. Loops need
   the request-level data the gateway captures.
 - Nothing is signed below the `invoice-reconciled` state.

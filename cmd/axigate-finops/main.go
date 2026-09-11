@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -278,7 +279,10 @@ func doGateway(args []string) error {
 	maxCalls := fs.Int("max-calls-per-run", 0, "pause a run after this many calls (0 = off)")
 	maxSpend := fs.Float64("max-spend-per-run", 0, "pause a run after this many USD of estimated spend (0 = off)")
 	reservePerCall := fs.Float64("reserve-per-call", 0, "least USD a call still running is assumed to cost for the spend cap, so a burst that hits a brand-new run (no cost recorded yet) is held at the cap (0 = reserve at the run's average only)")
+	keyDayCap := fs.Float64("max-spend-per-key-day", 0, "pause an API key after this many USD in a UTC day, whatever runs it starts — the leaked-key case (0 = off)")
+	keyCap := fs.Float64("max-spend-per-key", 0, "pause an API key after this many USD in total — for as long as this gateway runs, or as long as the store keeps it with --shared-counter; needs --admin-token so the key can be resumed (0 = off)")
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
+	shadow := fs.Bool("shadow", false, "serve every call, but mark the ones a cap would have refused and send the alert as \"would have stopped\" — watch a week before you enforce (the kill switch still refuses; give every replica sharing a store the same setting)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints (empty = no bypass, no admin)")
 	requestCaps := fs.Bool("request-caps", true, "honor a caller's X-AxiGate-Max-Spend header as a per-run spend cap set from code")
 	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
@@ -316,10 +320,13 @@ func doGateway(args []string) error {
 	gw := gateway.New(gateway.Config{
 		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"), SharedCounter: *sharedCounter,
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
-		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, MaxSpendUSDPerKeyDay: *keyDayCap, MaxSpendUSDPerKey: *keyCap, Shadow: *shadow, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
 	})
 	if err := gw.CounterError(); err != nil {
 		return err
+	}
+	if *keyCap > 0 && *sharedCounter != "" && *adminToken == "" {
+		return errors.New("--max-spend-per-key with --shared-counter needs --admin-token: a key at its total cap stays paused in the store across restarts, and only the admin endpoint can resume it")
 	}
 
 	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
@@ -332,11 +339,25 @@ func doGateway(args []string) error {
 		loopMsg = fmt.Sprintf("on (window %s, max %d/run, max %d identical)", *loopWindow, *loopMaxReq, *loopMaxRep)
 	}
 	ctrlMsg := "off"
-	if *maxCalls > 0 || *maxSpend > 0 || *pauseOnLoop {
-		ctrlMsg = fmt.Sprintf("on (max %d calls/run, max $%.2f/run, pause-on-loop=%v)", *maxCalls, *maxSpend, *pauseOnLoop)
-		if *adminToken == "" {
-			ctrlMsg += " — no admin token: a paused run needs a restart to clear"
+	if *maxCalls > 0 || *maxSpend > 0 || *pauseOnLoop || *keyDayCap > 0 || *keyCap > 0 {
+		ctrlMsg = fmt.Sprintf("on (max %d calls/run, max $%.2f/run, max $%.2f/key/day, max $%.2f/key total, pause-on-loop=%v)", *maxCalls, *maxSpend, *keyDayCap, *keyCap, *pauseOnLoop)
+		if *shadow {
+			ctrlMsg = "shadow " + ctrlMsg[len("on "):]
 		}
+		if *adminToken == "" {
+			if *shadow {
+				ctrlMsg += " — no admin token: a marked run or key needs a restart to clear"
+			} else {
+				ctrlMsg += " — no admin token: a paused run or key needs a restart to clear"
+			}
+		}
+	} else if *shadow && *requestCaps {
+		ctrlMsg = "shadow (no server-wide cap; a caller's X-AxiGate-Max-Spend is shadowed)"
+	} else if *shadow {
+		ctrlMsg = "shadow (no cap in effect)"
+	}
+	if *shadow {
+		ctrlMsg += "\n  shadow mode: every call is served; the ones a cap would refuse are marked on the row and alerted as \"would have stopped\"; the kill switch still refuses; every replica sharing a store should run with the same --shadow setting"
 	}
 	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  counter: %s\n  point your app's base URL at http://%s and keep your normal key\n  Claude Code: set ANTHROPIC_BASE_URL to it — each session is a run, nothing to tag\n",
 		*listen, base, *provider, *ledgerPath, loopMsg, ctrlMsg, gw.CounterLine(), *listen)
@@ -368,7 +389,10 @@ func doServe(args []string) error {
 	maxCalls := fs.Int("max-calls-per-run", 0, "server-wide per-run call cap (0 = off)")
 	maxSpend := fs.Float64("max-spend-per-run", 0, "server-wide per-run spend cap in USD (0 = off; callers can also set X-AxiGate-Max-Spend from code)")
 	reservePerCall := fs.Float64("reserve-per-call", 0, "least USD a call still running is assumed to cost for the spend cap, so a burst that hits a brand-new run (no cost recorded yet) is held at the cap (0 = reserve at the run's average only)")
+	keyDayCap := fs.Float64("max-spend-per-key-day", 0, "pause an API key after this many USD in a UTC day, whatever runs it starts — the leaked-key case (0 = off)")
+	keyCap := fs.Float64("max-spend-per-key", 0, "pause an API key after this many USD in total — for as long as this gateway runs, or as long as the store keeps it with --shared-counter; needs --admin-token so the key can be resumed (0 = off)")
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
+	shadow := fs.Bool("shadow", false, "serve every call, but mark the ones a cap would have refused and send the alert as \"would have stopped\" — watch a week before you enforce (the kill switch still refuses; give every replica sharing a store the same setting)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints")
 	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
 	sharedCounter := fs.String("shared-counter", "", "redis:// or rediss:// URL to keep run tallies in, so caps hold across gateway replicas (empty = per-process, in memory)")
@@ -405,10 +429,13 @@ func doServe(args []string) error {
 	gw := gateway.New(gateway.Config{
 		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"), SharedCounter: *sharedCounter,
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
-		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, MaxSpendUSDPerKeyDay: *keyDayCap, MaxSpendUSDPerKey: *keyCap, Shadow: *shadow, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
 	})
 	if err := gw.CounterError(); err != nil {
 		return err
+	}
+	if *keyCap > 0 && *sharedCounter != "" && *adminToken == "" {
+		return errors.New("--max-spend-per-key with --shared-counter needs --admin-token: a key at its total cap stays paused in the store across restarts, and only the admin endpoint can resume it")
 	}
 	con := console.New(nil)
 	con.SetLedgerFile(*ledgerPath) // live: the dashboard re-reads the shared ledger per request
@@ -428,6 +455,9 @@ func doServe(args []string) error {
 		"  Claude Code: set ANTHROPIC_BASE_URL to the gateway — each session is a run, nothing to tag\n"+
 		"  counter:    %s\n",
 		*provider, *gwListen, *consoleListen, *ledgerPath, gw.CounterLine())
+	if *shadow {
+		fmt.Println("  shadow mode: every call is served; the ones a cap would refuse are marked on the dashboard and alerted as \"would have stopped\"; the kill switch still refuses; every replica sharing a store should run with the same --shadow setting")
+	}
 	select {
 	case err := <-errc:
 		return err

@@ -50,6 +50,17 @@ func (g *Gateway) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, g.adminReply(map[string]any{"run": run, "resumed": g.ctrl.resumeRun(run)}))
+	case adminPrefix + "keys/resume":
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "method", "POST to resume a key")
+			return
+		}
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			writeJSONError(w, http.StatusBadRequest, "bad_request", "name the key to resume with ?key=<fingerprint or name>")
+			return
+		}
+		writeJSON(w, http.StatusOK, g.adminReply(map[string]any{"key": key, "resumed": g.ctrl.resumeKey(key)}))
 	default:
 		http.NotFound(w, r)
 	}

@@ -205,6 +205,19 @@ type BlockedRun struct {
 	AvoidedUSD float64 `json:"avoided_usd"`
 }
 
+// ShadowLine is a run or a key that a cap would have stopped while the
+// gateway ran in shadow mode: every one of its calls was served, so the
+// dollars here were actually spent past the cap — a receipt, not an estimate.
+type ShadowLine struct {
+	Who      string  `json:"who"`  // the run id, or the key's label
+	Kind     string  `json:"kind"` // "run" or "key"
+	Agent    string  `json:"agent"`
+	Model    string  `json:"model"`
+	Calls    int     `json:"calls"` // calls served that a cap would have refused
+	SpentUSD float64 `json:"spent_usd"`
+	Reason   string  `json:"reason"`
+}
+
 // Summary is the dashboard payload.
 type Summary struct {
 	Days         int          `json:"days"` // 0 = all time
@@ -219,6 +232,12 @@ type Summary struct {
 	LoopsBlocked int          `json:"loops_blocked"`
 	BlockedRuns  []BlockedRun `json:"blocked_runs"`
 	ByRun        []RunLine    `json:"by_run"` // top runs by spend — cost per run, not just per call
+	ByKey        []KeyLine    `json:"by_key"` // top API keys by spend, with what the gateway refused them — a leak shows here first
+	// ShadowCalls counts served calls that a cap would have refused while the
+	// gateway ran in shadow mode; ShadowSpendUSD is what they actually cost.
+	ShadowCalls    int          `json:"shadow_calls"`
+	ShadowSpendUSD float64      `json:"shadow_spend_usd"`
+	ShadowLines    []ShadowLine `json:"shadow_lines"`
 	// TotalState is the confidence state of TotalUSD: "estimated" when it is
 	// priced from tokens, "provider-reported" when a provider's own bill sets
 	// all of it, "mixed" when a bill covers some days and priced usage the
@@ -258,6 +277,40 @@ type RunLine struct {
 	Blocked    int     `json:"blocked"` // refused by the gateway
 	SpentUSD   float64 `json:"spent_usd"`
 	AvoidedUSD float64 `json:"avoided_usd"`
+}
+
+// KeyLine is one API key's rollup: the fingerprint the gateway recorded (never
+// the key), what it spent, and how often the gateway refused it. A refused
+// count on a key nobody recognises is the first sign of a leak.
+type KeyLine struct {
+	Key      string  `json:"key"`   // fingerprint (k-…-last4) or the name the caller gave
+	Label    string  `json:"label"` // "…last4" or the name, for display
+	Calls    int     `json:"calls"`
+	Failed   int     `json:"failed"`
+	Blocked  int     `json:"blocked"`
+	SpentUSD float64 `json:"spent_usd"`
+}
+
+// keyLabelOf shortens a key fingerprint for display the way providers do; a
+// fingerprint without a suffix (a short token) shows its hex; anything else
+// is a name and is shown as given.
+func keyLabelOf(key string) string {
+	if len(key) >= 15 && strings.HasPrefix(key, "k-") && key[14] == '-' && isHex(key[2:14]) {
+		if suffix := key[15:]; suffix != "" {
+			return "…" + suffix
+		}
+		return key[2:14]
+	}
+	return key
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return s != ""
 }
 
 // maxRunLines bounds the per-run rollup shown on the dashboard and in the API.
@@ -340,11 +393,31 @@ func summaryOf(sc scope, reqDays int) Summary {
 	agentByRun, modelByRun := map[string]string{}, map[string]string{}
 	var globalSum float64
 	var globalCnt int
+	shadowCalls, shadowSpend := 0, 0.0
+	shadow := map[string]*ShadowLine{}
 	for _, e := range metered {
 		if e.Source != "gateway" {
 			continue // a run is a gateway concept; an imported usage bucket is not a call
 		}
-		if e.Dimensions["blocked"] != "" {
+		if wr := e.Dimensions["would_refuse"]; wr != "" { // shadow mode: served, and a cap would have refused it
+			shadowCalls++
+			shadowSpend += e.CostUSD
+			id, kind, who := "run:"+e.Tags.Run, "run", e.Tags.Run
+			if strings.HasPrefix(wr, "key ") {
+				id, kind, who = "key:"+e.Dimensions["key"], "key", "key "+keyLabelOf(e.Dimensions["key"])
+			}
+			l := shadow[id]
+			if l == nil {
+				l = &ShadowLine{Who: who, Kind: kind, Agent: e.Tags.Agent, Model: e.Model, Reason: wr}
+				shadow[id] = l
+			}
+			l.Calls++
+			l.SpentUSD += e.CostUSD
+		}
+		if b := e.Dimensions["blocked"]; b != "" {
+			if strings.HasPrefix(b, "key ") || e.Tags.Run == "" {
+				continue // a key at its cap is not a runaway loop (it shows as refused under Spend by key), and a call with no run has no run to list
+			}
 			blocked++
 			byRun[e.Tags.Run]++
 			if agentByRun[e.Tags.Run] == "" {
@@ -386,6 +459,19 @@ func summaryOf(sc scope, reqDays int) Summary {
 			return globalSum / float64(globalCnt)
 		}
 		return 0
+	}
+	shadowLines := make([]ShadowLine, 0, len(shadow))
+	for _, l := range shadow {
+		shadowLines = append(shadowLines, *l)
+	}
+	sort.Slice(shadowLines, func(i, j int) bool {
+		if shadowLines[i].SpentUSD != shadowLines[j].SpentUSD {
+			return shadowLines[i].SpentUSD > shadowLines[j].SpentUSD
+		}
+		return shadowLines[i].Who < shadowLines[j].Who
+	})
+	if len(shadowLines) > 12 {
+		shadowLines = shadowLines[:12]
 	}
 	runs := make([]BlockedRun, 0, len(byRun))
 	var avoidedTotal float64
@@ -434,6 +520,58 @@ func summaryOf(sc scope, reqDays int) Summary {
 	})
 	if len(byRunLines) > maxRunLines {
 		byRunLines = byRunLines[:maxRunLines]
+	}
+
+	// Cost per key: what each API key spent across every run it started, and
+	// how often the gateway refused it. Only gateway rows carry a key.
+	type keyAgg struct {
+		calls, failed, blocked int
+		spent                  float64
+		name                   string
+	}
+	keys := map[string]*keyAgg{}
+	for _, e := range metered {
+		k := e.Dimensions["key"]
+		if e.Source != "gateway" || k == "" {
+			continue
+		}
+		a := keys[k]
+		if a == nil {
+			a = &keyAgg{}
+			keys[k] = a
+		}
+		if n := e.Dimensions["key_name"]; n != "" && e.Dimensions["blocked"] == "" {
+			a.name = n // a label from a served call; a refused call cannot rename a key on the dashboard
+		}
+		if e.Dimensions["blocked"] != "" {
+			a.blocked++
+			continue
+		}
+		a.calls++
+		if st := e.Dimensions["status"]; st != "" && !strings.HasPrefix(st, "2") {
+			a.failed++
+		}
+		a.spent += e.CostUSD
+	}
+	byKeyLines := make([]KeyLine, 0, len(keys))
+	for k, a := range keys {
+		label := keyLabelOf(k)
+		if a.name != "" {
+			label = a.name + " (" + label + ")"
+		}
+		byKeyLines = append(byKeyLines, KeyLine{Key: k, Label: label, Calls: a.calls, Failed: a.failed, Blocked: a.blocked, SpentUSD: a.spent})
+	}
+	sort.Slice(byKeyLines, func(i, j int) bool {
+		if byKeyLines[i].SpentUSD != byKeyLines[j].SpentUSD {
+			return byKeyLines[i].SpentUSD > byKeyLines[j].SpentUSD
+		}
+		if byKeyLines[i].Blocked != byKeyLines[j].Blocked {
+			return byKeyLines[i].Blocked > byKeyLines[j].Blocked
+		}
+		return byKeyLines[i].Key < byKeyLines[j].Key
+	})
+	if len(byKeyLines) > maxRunLines {
+		byKeyLines = byKeyLines[:maxRunLines]
 	}
 
 	// What the bill has that nothing metered accounts for, per provider and
@@ -525,7 +663,8 @@ func summaryOf(sc scope, reqDays int) Summary {
 		RangeStart: start.UTC().Format("2006-01-02"), RangeEnd: sc.latest.UTC().Format("2006-01-02"),
 		Events: len(evs), TotalUSD: r.TotalUSD,
 		ByProvider: linesOf(prov), ByTeam: linesOf(byTeam), ByAgent: linesOf(byAgent), ByModel: linesOf(model),
-		LoopsBlocked: blocked, BlockedRuns: runs, ByRun: byRunLines,
+		LoopsBlocked: blocked, BlockedRuns: runs, ByRun: byRunLines, ByKey: byKeyLines,
+		ShadowCalls: shadowCalls, ShadowSpendUSD: shadowSpend, ShadowLines: shadowLines,
 		TotalState: totalState, MeteredCalls: len(metered), UnmeteredUSD: unmetered, UnknownCostCalls: unknownCost, Teams: named(byTeam), Agents: named(byAgent),
 		Daily: daily, PeakDayUSD: peak, AvoidedUSD: avoidedTotal,
 	}

@@ -12,19 +12,22 @@ import (
 
 // RunCall is one request in a run's timeline, in the order it happened.
 type RunCall struct {
-	N          int
-	Time       string
-	Model      string
-	Status     string
-	Blocked    bool
-	Reason     string // why it was refused, when blocked
-	Loop       bool   // detection flagged this call as a suspected loop
-	LoopSignal string
-	InTok      int64
-	OutTok     int64
-	CacheRead  int64
-	CostUSD    float64
-	FirstBlock bool // the call where the cap first tripped — the divider anchor
+	N           int
+	Time        string
+	Model       string
+	Status      string
+	Blocked     bool
+	Reason      string // why it was refused, when blocked
+	Shadow      bool   // served in shadow mode although a cap would have refused it
+	WouldRefuse string // the reason, when Shadow
+	Loop        bool   // detection flagged this call as a suspected loop
+	LoopSignal  string
+	InTok       int64
+	OutTok      int64
+	CacheRead   int64
+	CostUSD     float64
+	FirstBlock  bool // the call where the cap first tripped — the divider anchor
+	FirstShadow bool // the first call served past the cap in shadow mode — the divider anchor
 }
 
 // RunDetail is everything the per-run drill-down shows: the run's identity, its
@@ -46,6 +49,8 @@ type RunDetail struct {
 	SpentUSD   float64
 	AvoidedUSD float64
 	Paused     bool
+	ShadowN    int     // calls served that a cap would have refused (shadow mode)
+	ShadowUSD  float64 // what those calls actually cost
 }
 
 // seqOf pulls the monotonic counter out of a "unixnano-seq" request id so calls
@@ -84,13 +89,14 @@ func runDetail(events []ledger.Event, run string) RunDetail {
 	d.Found = true
 	var okSum float64
 	var okCnt int
-	firstBlockSet := false
+	firstBlockSet, firstShadowSet := false, false
 	for i, e := range evs {
 		blocked := e.Dimensions["blocked"] != ""
 		call := RunCall{
 			N: i + 1, Time: e.StartsAt.UTC().Format("15:04:05"),
 			Model: e.Model, Status: e.Dimensions["status"],
 			Blocked: blocked, Reason: e.Dimensions["blocked"],
+			Shadow: e.Dimensions["would_refuse"] != "", WouldRefuse: e.Dimensions["would_refuse"],
 			Loop: e.Dimensions["loop"] == "suspected", LoopSignal: e.Dimensions["loop_signal"],
 			InTok: e.Usage.InputTokens, OutTok: e.Usage.OutputTokens, CacheRead: e.Usage.CacheRead,
 			CostUSD: e.CostUSD,
@@ -109,6 +115,14 @@ func runDetail(events []ledger.Event, run string) RunDetail {
 			if e.CostUSD > 0 {
 				okSum += e.CostUSD
 				okCnt++
+			}
+			if call.Shadow {
+				d.ShadowN++
+				d.ShadowUSD += e.CostUSD
+				if !firstShadowSet {
+					call.FirstShadow = true
+					firstShadowSet = true
+				}
 			}
 		}
 		// carry the run's identity from whichever call has it

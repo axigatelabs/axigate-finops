@@ -9,16 +9,21 @@ package gateway
 // admitWhere says where the decision was made and the gateway hands that back.
 type budget interface {
 	noteRun(run, agent, team, model string)
+	noteKey(key, agent, team, model string)
 	// admitWhere decides before the request leaves and says where it decided:
 	// "" for the per-process counter, "shared" (with a per-call token after a
 	// colon) when the shared store answered, "local" when the store was
 	// unreachable and the per-process fallback decided instead. The row
-	// carries the word before the colon (counterLabel).
-	admitWhere(run string, bypass bool) (ok bool, reason, where string)
-	record(run string, costUSD float64, suspectedLoop bool, where string)
-	release(run string, where string)
+	// carries the word before the colon (counterLabel). key is the call's
+	// API-key fingerprint, "" when the request carries none. In shadow mode a
+	// call a cap would refuse comes back ok with the reason it would have
+	// been refused for; otherwise ok and reason are exclusive.
+	admitWhere(run, key string, bypass bool) (ok bool, reason, where string)
+	record(run, key string, costUSD float64, suspectedLoop bool, where string)
+	release(run, key string, where string)
 	setRunCap(run string, maxSpendUSD float64)
 	resumeRun(run string) bool
+	resumeKey(key string) bool
 	setKilled(on bool)
 	status() Status
 	setOnPause(func(StopEvent))
@@ -38,13 +43,13 @@ func (m memoryBudget) setOnPause(f func(StopEvent)) { m.onPause = f }
 func (m memoryBudget) mode() string                 { return "" }
 func (m memoryBudget) pending() bool                { return false }
 
-func (m memoryBudget) admitWhere(run string, bypass bool) (bool, string, string) {
-	ok, reason := m.admit(run, bypass)
+func (m memoryBudget) admitWhere(run, key string, bypass bool) (bool, string, string) {
+	ok, reason := m.admitKeyed(run, key, bypass)
 	return ok, reason, ""
 }
 
-func (m memoryBudget) record(run string, costUSD float64, suspectedLoop bool, _ string) {
-	m.controller.record(run, costUSD, suspectedLoop)
+func (m memoryBudget) record(run, key string, costUSD float64, suspectedLoop bool, _ string) {
+	m.recordKeyed(run, key, costUSD, suspectedLoop)
 }
 
-func (m memoryBudget) release(run string, _ string) { m.controller.release(run) }
+func (m memoryBudget) release(run, key string, _ string) { m.releaseKeyed(run, key) }

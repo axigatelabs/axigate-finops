@@ -577,3 +577,220 @@ func TestARecorderPanicStillSettlesTheCounter(t *testing.T) {
 type panicRecorder struct{}
 
 func (panicRecorder) Record(ledger.Event) { panic("recorder is broken") }
+
+// Two runs on one key: the key's ceiling holds where a run cap would not, the
+// rows carry the key's fingerprint and never the key, and the refusal names it.
+func TestAKeyCeilingHoldsAcrossRunsEndToEnd(t *testing.T) {
+	const answer = `{"model":"gpt-4o","choices":[{"message":{"content":"ok"}}],` +
+		`"usage":{"prompt_tokens":1000000,"completion_tokens":1000000}}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	defer up.Close()
+	rec := &capture{}
+	gw := New(Config{Upstream: up.URL, Provider: "openai", Recorder: rec, Now: fixedClock(),
+		Control: ControlPolicy{MaxSpendUSDPerKeyDay: 1, AdminToken: "tok", Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+	call := func(run string, extra ...string) (int, string) {
+		req, _ := http.NewRequest("POST", front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer sk-live-leakedkey-7788")
+		req.Header.Set("X-AxiGate-Run", run)
+		for i := 0; i+1 < len(extra); i += 2 {
+			req.Header.Set(extra[i], extra[i+1])
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+	if code, _ := call("run-a"); code != 200 {
+		t.Fatalf("first run served, got %d", code)
+	}
+	code, body := call("run-b") // a NEW run on the same key: refused by the key's ceiling
+	if code != 429 || !strings.Contains(body, "key …7788 reached its daily spend cap of $1.00") || !strings.Contains(body, `"type":"key_paused"`) {
+		t.Fatalf("a fresh run on a capped key must be refused with the key named: %d %s", code, body)
+	}
+	// Renaming the key is not a way around its ceiling: the credential is the identity.
+	if code, _ := call("run-b2", "X-AxiGate-Key", "alias-1"); code != 429 {
+		t.Fatalf("a label must not dodge the cap, got %d", code)
+	}
+	if rec.count() != 3 {
+		t.Fatalf("want 3 rows, got %d", rec.count())
+	}
+	fp := rec.events[0].Dimensions["key"]
+	for _, e := range rec.events {
+		k := e.Dimensions["key"]
+		if !strings.HasPrefix(k, "k-") || !strings.HasSuffix(k, "-7788") || strings.Contains(k, "leaked") || k != fp {
+			t.Fatalf("rows carry the one fingerprint, never the key: %q", k)
+		}
+	}
+	if rec.events[2].Dimensions["key_name"] != "alias-1" || rec.events[0].Dimensions["key_name"] != "" {
+		t.Fatalf("the label rides along as key_name only when given: %v", rec.events[2].Dimensions)
+	}
+	// Resume by the admin endpoint on this gateway, and the key admits again.
+	req, _ := http.NewRequest("POST", front.URL+"/_axigate/keys/resume?key="+fp, nil)
+	req.Header.Set("X-AxiGate-Admin", "tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(rb), `"resumed":true`) {
+		t.Fatalf("keys/resume = %d %s", resp.StatusCode, rb)
+	}
+	if code, _ := call("run-c"); code != 200 {
+		t.Fatalf("a resumed key is served again, got %d", code)
+	}
+}
+
+// A Gemini key travels in the query string; it is capped like a header key
+// and never lands in a row.
+func TestAKeyInTheQueryIsCappedLikeAHeader(t *testing.T) {
+	const answer = `{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],` +
+		`"usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":1000000,"totalTokenCount":2000000}}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	defer up.Close()
+	rec := &capture{}
+	gw := New(Config{Upstream: up.URL, Provider: "gemini", Recorder: rec, Now: fixedClock(),
+		Control: ControlPolicy{MaxSpendUSDPerKeyDay: 1, Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+	call := func() int {
+		resp, err := http.Post(front.URL+"/v1beta/models/gemini-2.5-flash:generateContent?key=AIzaLeakedGeminiKey9911", "application/json", strings.NewReader(`{"contents":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if call() != 200 {
+		t.Fatal("first call served")
+	}
+	if call() != 429 {
+		t.Fatal("the key in the query is at its cap")
+	}
+	for _, e := range rec.events {
+		if k := e.Dimensions["key"]; !strings.HasSuffix(k, "-9911") || strings.Contains(k, "Leaked") {
+			t.Fatalf("row key = %q", k)
+		}
+	}
+}
+
+// Without a key cap the counters never track a key (a store deployed for run
+// caps alone gains nothing on upgrade), while the row still carries the
+// fingerprint for the dashboard.
+func TestAKeyIsNotTrackedWithoutAKeyCap(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":10}}`))
+	}))
+	defer up.Close()
+	rec := &capture{}
+	gw := New(Config{Upstream: up.URL, Provider: "openai", Recorder: rec, Now: fixedClock(),
+		Control: ControlPolicy{MaxSpendUSDPerRun: 1, Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+	req, _ := http.NewRequest("POST", front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer sk-live-somekey-4321")
+	req.Header.Set("X-AxiGate-Run", "run-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if rec.count() != 1 || !strings.HasSuffix(rec.events[0].Dimensions["key"], "-4321") {
+		t.Fatalf("the row carries the fingerprint: %v", rec.events)
+	}
+	mb, ok := gw.ctrl.(memoryBudget)
+	if !ok {
+		t.Fatalf("in-memory counter expected, got %T", gw.ctrl)
+	}
+	mb.controller.mu.Lock()
+	n := len(mb.controller.keys)
+	mb.controller.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("no key cap, no key tracked; got %d", n)
+	}
+}
+
+// Shadow mode end to end: the call past the cap is served, the row says a
+// cap would have refused it, the alert says "would have stopped", status
+// shows the mode, and the kill switch still refuses.
+func TestShadowModeServesPastTheCapAndMarksTheRow(t *testing.T) {
+	const answer = `{"model":"gpt-4o","choices":[{"message":{"content":"ok"}}],` +
+		`"usage":{"prompt_tokens":1000000,"completion_tokens":1000000}}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	defer up.Close()
+	got := make(chan map[string]any, 4)
+	hook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		got <- m
+	}))
+	defer hook.Close()
+	rec := &capture{}
+	gw := New(Config{Upstream: up.URL, Provider: "openai", Recorder: rec, Now: fixedClock(), StopAlertURL: hook.URL,
+		Control: ControlPolicy{MaxSpendUSDPerRun: 1, Shadow: true, AdminToken: "tok", Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+	call := func() int {
+		req, _ := http.NewRequest("POST", front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+		req.Header.Set("X-AxiGate-Run", "run-1")
+		req.Header.Set("X-AxiGate-Agent", "reconciler")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if call() != 200 || call() != 200 {
+		t.Fatal("both calls are served in shadow mode")
+	}
+	if rec.count() != 2 || rec.events[0].Dimensions["would_refuse"] != "" || rec.events[1].Dimensions["would_refuse"] != "run reached the spend cap of $1.00" {
+		t.Fatalf("the second row says a cap would have refused it: %v / %v", rec.events[0].Dimensions, rec.events[1].Dimensions)
+	}
+	select {
+	case m := <-got:
+		line, _ := m["text"].(string)
+		if m["event"] != "run_flagged" || m["shadow"] != true || !strings.HasPrefix(line, "AxiGate would have stopped reconciler (run run-1)") || !strings.Contains(line, "shadow mode is on") {
+			t.Fatalf("alert = %v", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no alert")
+	}
+	sreq, _ := http.NewRequest("GET", front.URL+"/_axigate/status", nil)
+	sreq.Header.Set("X-AxiGate-Admin", "tok")
+	sresp, err := http.DefaultClient.Do(sreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st Status
+	_ = json.NewDecoder(sresp.Body).Decode(&st)
+	sresp.Body.Close()
+	if !st.Policy.Shadow || len(st.PausedRuns) != 1 || !strings.Contains(st.Note, "not refused") {
+		t.Fatalf("status shows the mode, the marked run and the note: %+v", st)
+	}
+	kreq, _ := http.NewRequest("POST", front.URL+"/_axigate/kill", nil)
+	kreq.Header.Set("X-AxiGate-Admin", "tok")
+	kresp, err := http.DefaultClient.Do(kreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kresp.Body.Close()
+	if call() != 503 {
+		t.Fatal("the kill switch still refuses in shadow mode")
+	}
+}
