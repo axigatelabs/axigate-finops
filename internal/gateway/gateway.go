@@ -162,10 +162,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if model == "" && g.cfg.Provider == "gemini" {
 		model = geminiModelFromPath(r.URL.Path) // Gemini names the model in the path, not the body
 	}
-	run := strings.TrimSpace(r.Header.Get("X-AxiGate-Run"))
+	// The run is the caller's X-AxiGate-Run, or the session/trace id the
+	// client already sends (Claude Code, LiteLLM, W3C traceparent).
+	id := identityFromHeaders(r.Header)
+	run := id.Run
 
-	// Loop detection reads the caller's explicit run id; a request with no run
-	// id cannot be tied to a run, so it is never flagged.
+	// Loop detection reads that run id; a request with no run id cannot be
+	// tied to a run, so it is never flagged.
 	var dec Decision
 	if g.det != nil && run != "" {
 		dec = g.det.observe(run, signature(g.cfg.Provider, model, reqBody), g.cfg.Now().UTC())
@@ -317,6 +320,7 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 			dims["loop_repeat"] = strconv.Itoa(dec.Repeat)
 		}
 	}
+	identityFromHeaders(r.Header).dims(dims)
 
 	e := ledger.Event{
 		Source:     SourceGateway,
@@ -367,6 +371,7 @@ func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code
 		"status":     strconv.Itoa(code),
 		"blocked":    reason,
 	}
+	identityFromHeaders(r.Header).dims(dims)
 	e := ledger.Event{
 		Source: SourceGateway, Provider: g.cfg.Provider, Model: model, Dimensions: dims,
 		Usage: ledger.Usage{}, Tags: tagsFromHeaders(r.Header),
@@ -376,16 +381,18 @@ func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code
 	g.cfg.Recorder.Record(e)
 }
 
-// tagsFromHeaders reads the caller's own attribution off X-AxiGate-* headers.
-// These are how a request is attributed to an owner; the gateway sees them and
-// records them, and never infers them.
+// tagsFromHeaders reads the caller's own attribution off X-AxiGate-* headers,
+// with the run and agent falling back to the ids the client already sends
+// (see identityFromHeaders). These are how a request is attributed to an
+// owner; the gateway reads them and records them, and never infers them.
 func tagsFromHeaders(h http.Header) ledger.Tags {
+	id := identityFromHeaders(h)
 	return ledger.Tags{
 		Team:     strings.TrimSpace(h.Get("X-AxiGate-Team")),
 		Project:  strings.TrimSpace(h.Get("X-AxiGate-Project")),
 		Customer: strings.TrimSpace(h.Get("X-AxiGate-Customer")),
-		Agent:    strings.TrimSpace(h.Get("X-AxiGate-Agent")),
-		Run:      strings.TrimSpace(h.Get("X-AxiGate-Run")),
+		Agent:    id.Agent,
+		Run:      id.Run,
 	}
 }
 

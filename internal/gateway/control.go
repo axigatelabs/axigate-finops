@@ -3,6 +3,8 @@ package gateway
 import (
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -81,6 +83,17 @@ type StopEvent struct {
 // spendCapLocked returns the binding spend cap: the strictest of the server-wide
 // policy and the caller's inline X-AxiGate-Max-Spend, ignoring the ones left off.
 // The caller must hold c.mu.
+// money prints a dollar figure to the cent, or to the tenth of a cent when the
+// cap was set finer than that — a $0.015 cap must not read as $0.01.
+func money(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 4, 64)
+	s = strings.TrimRight(s, "0")
+	if i := strings.IndexByte(s, '.'); i >= 0 && len(s)-i-1 < 2 {
+		s += strings.Repeat("0", 2-(len(s)-i-1))
+	}
+	return "$" + s
+}
+
 func (c *controller) spendCapLocked(st *runState) float64 {
 	cap := c.policy.MaxSpendUSDPerRun
 	if st.maxSpendUSD > 0 && (cap == 0 || st.maxSpendUSD < cap) {
@@ -196,7 +209,7 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 				}
 			}
 			if st.spendUSD+perCall*float64(st.inflight) >= cap {
-				c.pauseLocked(run, st, fmt.Sprintf("run reached the spend cap of $%.2f", cap))
+				c.pauseLocked(run, st, "run reached the spend cap of "+money(cap))
 				return false, st.reason
 			}
 		}
@@ -231,7 +244,7 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		case c.policy.MaxCallsPerRun > 0 && st.calls >= c.policy.MaxCallsPerRun:
 			c.pauseLocked(run, st, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun))
 		case spendCap > 0 && st.spendUSD >= spendCap:
-			c.pauseLocked(run, st, fmt.Sprintf("run reached the spend cap of $%.2f", spendCap))
+			c.pauseLocked(run, st, "run reached the spend cap of "+money(spendCap))
 		case suspectedLoop && c.policy.PauseOnSuspectedLoop:
 			c.pauseLocked(run, st, "suspected loop")
 		}
