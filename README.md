@@ -297,6 +297,10 @@ made on another replica during the gap is seen when the store returns.
   no average to reserve against yet. For a sequential agent it is exact. Run
   more than one gateway? Give them one counter with `--shared-counter` (above)
   and the cap holds across all of them.
+- A call the provider served but never reported usage for (a stream that ended
+  early) settles at no cost so the run keeps moving, and is counted on the
+  dashboard as a call with unknown cost — not as a free one. The provider's
+  bill is what fills it in.
 - A provider export shows spend, cache use and spikes, but not loops. Loops need
   the request-level data the gateway captures.
 - Nothing is signed below the `invoice-reconciled` state.

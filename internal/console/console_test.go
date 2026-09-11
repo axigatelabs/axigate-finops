@@ -170,3 +170,40 @@ func TestBlockedRunsShowAgentModelAndAvoidedSpend(t *testing.T) {
 		t.Fatalf("total avoided (%.4f) must be >= the top run's (%.4f)", s.AvoidedUSD, top.AvoidedUSD)
 	}
 }
+
+// A served call with no usage behind it is named, never mistaken for a free one.
+func TestUnknownCostCallsAreNamedNotFree(t *testing.T) {
+	known := seed.Generate(seed.Options{Events: 20, Seed: 4})
+	unknown := known[0]
+	unknown.Usage = ledger.Usage{Requests: 1}
+	unknown.CostUSD = 0
+	unknown.Dimensions = map[string]string{"status": "200", "usage": "unknown", "request_id": "u-1"}
+	unknown.DeriveID()
+	srv := httptest.NewServer(New(append(known, unknown)))
+	defer srv.Close()
+	sum := getSummary(t, srv.URL, "/api/summary?days=all")
+	if sum.UnknownCostCalls != 1 {
+		t.Fatalf("unknown_cost_calls = %d, want 1", sum.UnknownCostCalls)
+	}
+	resp, err := http.Get(srv.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "came back without usage") || !strings.Contains(string(raw), "not as free") {
+		t.Fatal("dashboard should name the unknown-cost call")
+	}
+	// Without such a call the footnote stays away.
+	plain := httptest.NewServer(New(known))
+	defer plain.Close()
+	resp2, err := http.Get(plain.URL + "/?days=all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	raw2, _ := io.ReadAll(resp2.Body)
+	if strings.Contains(string(raw2), "came back without usage") {
+		t.Fatal("no unknown-cost footnote without such a call")
+	}
+}
