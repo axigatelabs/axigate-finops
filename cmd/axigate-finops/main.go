@@ -329,7 +329,7 @@ func doGateway(args []string) error {
 			ctrlMsg += " — no admin token: a paused run needs a restart to clear"
 		}
 	}
-	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  point your app's base URL at http://%s and keep your normal key\n",
+	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  point your app's base URL at http://%s and keep your normal key\n  Claude Code: set ANTHROPIC_BASE_URL to it — each session is a run, nothing to tag\n",
 		*listen, base, *provider, *ledgerPath, loopMsg, ctrlMsg, *listen)
 	select {
 	case err := <-errc:
@@ -406,7 +406,8 @@ func doServe(args []string) error {
 		"  gateway    http://%s   → point your app's base URL here, keep your normal key\n"+
 		"  dashboard  http://%s   → open in a browser; spend appears live\n"+
 		"  ledger     %s (metadata only)\n"+
-		"  inline cap: set X-AxiGate-Run and X-AxiGate-Max-Spend in your code to cap a run, no restart\n",
+		"  inline cap: set X-AxiGate-Run and X-AxiGate-Max-Spend in your code to cap a run, no restart\n"+
+		"  Claude Code: set ANTHROPIC_BASE_URL to the gateway — each session is a run, nothing to tag\n",
 		*provider, *gwListen, *consoleListen, *ledgerPath)
 	select {
 	case err := <-errc:

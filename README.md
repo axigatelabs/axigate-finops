@@ -75,6 +75,14 @@ axigate-finops gateway --provider anthropic --listen 127.0.0.1:8787 \
 Then two lines in your app: point the SDK's base URL at the gateway, and tag
 each call with the run it belongs to. Keep using your normal API key.
 
+**Using Claude Code?** There is nothing to tag. Set `ANTHROPIC_BASE_URL` to the
+gateway and every Claude Code session is a run: the gateway reads the
+`x-claude-code-session-id` header Claude Code already sends, and the agent and
+parent-agent ids on subagent calls, so the caps, the loop detector and the
+run drill-down work on a session with no code change. A W3C `traceparent`
+header or LiteLLM's `x-litellm-trace-id` count as a run the same way. Your own
+`X-AxiGate-Run` and `X-AxiGate-Agent` headers always win when you set them.
+
 **Python (OpenAI):**
 
 ```python
@@ -198,7 +206,8 @@ different place; that is not the point. The difference is:
   `--max-spend-per-run` stops on the money.
 - **It survives the agent's crash-restart loop.** When a framework crashes and
   restarts, its own in-code counter resets each time and keeps burning money.
-  The gateway's cap is keyed to the `X-AxiGate-Run` id you pass, so as long as
+  The gateway's cap is keyed to the run id (the `X-AxiGate-Run` you pass, or
+  the session id Claude Code sends), so as long as
   the gateway stays up it keeps counting a run across those restarts — a
   per-process framework counter never sees them. (The gateway's *own* restart
   resets the tally; it lives in memory — see the limits below.)

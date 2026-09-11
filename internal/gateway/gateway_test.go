@@ -471,3 +471,68 @@ func TestEachRequestGetsADistinctId(t *testing.T) {
 		ids[e.ID] = true
 	}
 }
+
+// A Claude Code session carries its own ids. With no X-AxiGate header at all,
+// the session is the run: it is attributed, its subagents are named, and the
+// spend cap stops it, exactly as a hand-tagged run would be.
+func TestClaudeCodeSessionIsARunWithNothingToTag(t *testing.T) {
+	const answer = `{"model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],` +
+		`"usage":{"input_tokens":1000000,"output_tokens":1000000}}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(answer))
+	}))
+	defer up.Close()
+	rec := &capture{}
+	gw := New(Config{Upstream: up.URL, Provider: "anthropic", Recorder: rec, Now: fixedClock(),
+		Control: ControlPolicy{MaxSpendUSDPerRun: 0.01, Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+
+	call := func(agent, parent string) int {
+		req, _ := http.NewRequest("POST", front.URL+"/v1/messages",
+			strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[]}`))
+		req.Header.Set("x-claude-code-session-id", "sess-7f")
+		if agent != "" {
+			req.Header.Set("x-claude-code-agent-id", agent)
+		}
+		if parent != "" {
+			req.Header.Set("x-claude-code-parent-agent-id", parent)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// The session's first call is served and blows the cap; a subagent's call
+	// in the same session is refused before it leaves.
+	if code := call("", ""); code != http.StatusOK {
+		t.Fatalf("first call in the session should be served, got %d", code)
+	}
+	if code := call("agent-b", "agent-root"); code != http.StatusTooManyRequests {
+		t.Fatalf("the session's next call should be refused by the cap, got %d", code)
+	}
+	if rec.count() != 2 {
+		t.Fatalf("want 2 rows (served + refused), got %d", rec.count())
+	}
+	served, refused := rec.events[0], rec.events[1]
+	if served.Tags.Run != "sess-7f" || served.Tags.Agent != "" || served.Dimensions["run_id_from"] != "claude-code" {
+		t.Fatalf("served row not attributed to the session: tags=%+v dims=%v", served.Tags, served.Dimensions)
+	}
+	if refused.Tags.Run != "sess-7f" || refused.Tags.Agent != "agent-b" || refused.Dimensions["parent_agent"] != "agent-root" || refused.Dimensions["blocked"] == "" {
+		t.Fatalf("refused subagent row wrong: tags=%+v dims=%v", refused.Tags, refused.Dimensions)
+	}
+	// A different session is a different run and is not affected.
+	req, _ := http.NewRequest("POST", front.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5","messages":[]}`))
+	req.Header.Set("x-claude-code-session-id", "sess-other")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("another session must not be refused, got %d", resp.StatusCode)
+	}
+}

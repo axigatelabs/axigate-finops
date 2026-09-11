@@ -169,3 +169,11 @@ func TestStrictestSpendCapWins(t *testing.T) {
 		t.Fatal("the stricter server cap ($5) should pause the run")
 	}
 }
+
+func TestMoneyPrintsCentsOrFinerWhenTheCapIsFiner(t *testing.T) {
+	for v, want := range map[float64]string{1: "$1.00", 0.1: "$0.10", 0.02: "$0.02", 0.015: "$0.015", 5.5: "$5.50", 0.0075: "$0.0075"} {
+		if got := money(v); got != want {
+			t.Errorf("money(%v) = %q, want %q", v, got, want)
+		}
+	}
+}
