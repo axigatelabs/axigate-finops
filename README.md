@@ -117,7 +117,10 @@ a run that exceeds `--max-calls-per-run` (or repeats an identical call past
 `--loop-max-repeats`) is refused with a `429` before it costs you anything. You
 can also cap a run from your code with `X-AxiGate-Max-Spend` (e.g. `"5.00"`) —
 no server flag or restart — and the `X-AxiGate-Team`, `X-AxiGate-Project` and
-`X-AxiGate-Customer` headers attribute further.
+`X-AxiGate-Customer` headers attribute further. If your agents fan out (many
+workers firing at once under one run id), add `--reserve-per-call 0.05`: the
+least each in-flight call is assumed to cost, so a burst that hits a brand-new
+run is held at the cap instead of slipping past it before the first cost lands.
 
 ## The CLI — analyze what you already have, no keys required
 
@@ -240,9 +243,11 @@ place of the flag.
 
 - Per-run caps are enforced in memory: the gateway's own restart resets a run's
   tally, and the cap is per-process (behind a load balancer each replica counts
-  on its own). Each call is reserved at admit, so a concurrent burst trips the
-  cap at the boundary; the residual overshoot is the calls already in flight
-  before the run's first cost is recorded. For a sequential agent it is exact. A
+  on its own). Each call is reserved at admit — at the run's average cost so
+  far, or at `--reserve-per-call` when that is higher — so a concurrent burst
+  trips the cap at the boundary. Without that floor, the calls already in flight
+  before a run's first cost is recorded can slip past the cap, because there is
+  no average to reserve against yet. For a sequential agent it is exact. A
   durable, exact bound across replicas is the hosted tier's job, on the roadmap.
 - A provider export shows spend, cache use and spikes, but not loops. Loops need
   the request-level data the gateway captures.

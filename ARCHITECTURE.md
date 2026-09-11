@@ -34,7 +34,7 @@ disagree.
 | `internal/importers/*` | OpenAI/Anthropic JSON reports, the Anthropic Console cost CSV, the gateway JSONL, and `anyfile` detection |
 | `internal/owners` | map provider ids to team/project/customer/agent |
 | `internal/report` | aggregation, the unknown bucket, reconciliation; `Included` sets the total's membership |
-| `internal/statement`, `internal/focus` | the flat statement CSV and the FOCUS 1.2 export, both over `report.Included` |
+| `internal/statement`, `internal/focus` | the flat statement CSV (every row, usage and bill, each with its confidence state) and the FOCUS 1.2 export (over `report.Included`, so BilledCost sums to the total) |
 | `internal/gateway` | the proxy: forwarding, usage extraction (incl. streaming), loop detection and control, the JSONL recorder |
 | `internal/console` | the HTTP dashboard, the per-run loop drill-down, the JSON/statement/FOCUS API |
 | `internal/seed` | synthetic events for the console |

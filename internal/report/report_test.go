@@ -163,3 +163,57 @@ func TestUnlistedModelsAreNamedNotHidden(t *testing.T) {
 		t.Fatalf("listed-only report mentions the fallback: %+v", r.Unlisted)
 	}
 }
+
+func TestCostRowsOnlyReplaceUsageRowsOfTheirOwnPeriod(t *testing.T) {
+	// August has the provider's bill; September so far has only live usage.
+	// The August bill must not silence September's spend.
+	sep := usage("openai", "gpt-4o", "key_1", 1, ledger.Usage{InputTokens: 1000}, ledger.Tags{Team: "eng"}, 2.0)
+	sep.StartsAt, sep.EndsAt = time.Date(2025, 9, 3, 0, 0, 0, 0, time.UTC), time.Date(2025, 9, 4, 0, 0, 0, 0, time.UTC)
+	sep.DeriveID()
+	events := []ledger.Event{
+		usage("openai", "gpt-4o", "key_1", 1, ledger.Usage{InputTokens: 1000}, ledger.Tags{Team: "eng"}, 3.0), // August: detail only
+		cost("openai", "gpt-4o", 1, 12.5), // August: the bill
+		sep,
+	}
+	r := Build(events)
+	if r.TotalUSD != 14.5 {
+		t.Fatalf("total = %.2f, want 12.5 (August bill) + 2.0 (September usage)", r.TotalUSD)
+	}
+	if got := len(Included(events)); got != 2 {
+		t.Fatalf("Included = %d rows, want the bill and September's usage", got)
+	}
+	if len(r.Reconciliations) != 1 || r.Reconciliations[0].Period != "2025-08" {
+		t.Fatalf("only August has both sides to reconcile: %+v", r.Reconciliations)
+	}
+	if len(r.Notes) != 1 {
+		t.Fatalf("one note per provider, got %+v", r.Notes)
+	}
+	if m := Metered(events); len(m) != 2 || IsCostRow(m[0]) || IsCostRow(m[1]) {
+		t.Fatalf("Metered should be the two usage rows, got %d", len(m))
+	}
+}
+
+func TestABillReplacesOnlyTheDaysItCovers(t *testing.T) {
+	// A daily cost page for August 1st lands while usage continues on the 10th:
+	// the bill sets the 1st, the 10th stays priced usage, and the two are
+	// reconciled only over the day they share.
+	events := []ledger.Event{
+		usage("openai", "gpt-4o", "key_1", 1, ledger.Usage{InputTokens: 1000}, ledger.Tags{Team: "eng"}, 3.0),
+		usage("openai", "gpt-4o", "key_1", 10, ledger.Usage{InputTokens: 1000}, ledger.Tags{Team: "eng"}, 2.0),
+		cost("openai", "gpt-4o", 1, 12.5),
+	}
+	r := Build(events)
+	if r.TotalUSD != 14.5 {
+		t.Fatalf("total = %.2f, want 12.5 (the 1st, billed) + 2.0 (the 10th, priced)", r.TotalUSD)
+	}
+	if len(r.Reconciliations) != 1 || r.Reconciliations[0].EstimatedUSD != 3.0 || r.Reconciliations[0].ReportedUSD != 12.5 {
+		t.Fatalf("reconcile the covered day only: %+v", r.Reconciliations)
+	}
+	cov := CostCoverage(events)
+	if !cov.Covers(events[0]) || cov.Covers(events[1]) {
+		t.Fatalf("coverage should be the 1st only: %v", cov)
+	}
+	if len(r.Notes) != 1 || !strings.Contains(r.Notes[0], "2025-08") {
+		t.Fatalf("the note names the billed month: %+v", r.Notes)
+	}
+}

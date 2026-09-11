@@ -130,10 +130,20 @@ func TestDashboardBootsAndRendersTheHeadlineNumbers(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	html := string(raw)
-	for _, want := range []string{"AxiGate", "Total spend", "Runaway", "Spend by team", "FOCUS"} {
+	for _, want := range []string{"AxiGate", "Total spend", "Runaway", "Spend by team", "FOCUS", `every figure is the <span class="num">estimated</span> state`} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("dashboard missing %q", want)
 		}
+	}
+	// The common case — a ledger with no provider bill — must not show the
+	// gap line, and its total must read as the estimated state.
+	for _, never := range []string{"(billed, not metered)", "provider-reported"} {
+		if strings.Contains(html, never) {
+			t.Fatalf("dashboard over a bill-free ledger must not mention %q", never)
+		}
+	}
+	if sum := getSummary(t, srv.URL, "/api/summary"); sum.TotalState != "estimated" || sum.UnmeteredUSD != 0 {
+		t.Fatalf("bill-free ledger: total_state=%q unmetered=%.4f, want estimated / 0", sum.TotalState, sum.UnmeteredUSD)
 	}
 }
 

@@ -277,6 +277,7 @@ func doGateway(args []string) error {
 	loopMaxRep := fs.Int("loop-max-repeats", 0, "identical requests per run within the window that flag a loop (0 = off)")
 	maxCalls := fs.Int("max-calls-per-run", 0, "pause a run after this many calls (0 = off)")
 	maxSpend := fs.Float64("max-spend-per-run", 0, "pause a run after this many USD of estimated spend (0 = off)")
+	reservePerCall := fs.Float64("reserve-per-call", 0, "least USD a call still running is assumed to cost for the spend cap, so a burst that hits a brand-new run (no cost recorded yet) is held at the cap (0 = reserve at the run's average only)")
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints (empty = no bypass, no admin)")
 	requestCaps := fs.Bool("request-caps", true, "honor a caller's X-AxiGate-Max-Spend header as a per-run spend cap set from code")
@@ -309,7 +310,7 @@ func doGateway(args []string) error {
 	gw := gateway.New(gateway.Config{
 		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
-		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
 	})
 
 	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
@@ -357,6 +358,7 @@ func doServe(args []string) error {
 	loopMaxRep := fs.Int("loop-max-repeats", 0, "identical requests per run within the window that flag a loop (0 = off)")
 	maxCalls := fs.Int("max-calls-per-run", 0, "server-wide per-run call cap (0 = off)")
 	maxSpend := fs.Float64("max-spend-per-run", 0, "server-wide per-run spend cap in USD (0 = off; callers can also set X-AxiGate-Max-Spend from code)")
+	reservePerCall := fs.Float64("reserve-per-call", 0, "least USD a call still running is assumed to cost for the spend cap, so a burst that hits a brand-new run (no cost recorded yet) is held at the cap (0 = reserve at the run's average only)")
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints")
 	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
@@ -388,7 +390,7 @@ func doServe(args []string) error {
 	gw := gateway.New(gateway.Config{
 		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
-		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
+		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
 	})
 	con := console.New(nil)
 	con.SetLedgerFile(*ledgerPath) // live: the dashboard re-reads the shared ledger per request
