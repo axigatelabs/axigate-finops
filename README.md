@@ -209,8 +209,8 @@ different place; that is not the point. The difference is:
   The gateway's cap is keyed to the run id (the `X-AxiGate-Run` you pass, or
   the session id Claude Code sends), so as long as
   the gateway stays up it keeps counting a run across those restarts — a
-  per-process framework counter never sees them. (The gateway's *own* restart
-  resets the tally; it lives in memory — see the limits below.)
+  per-process framework counter never sees them. (Without `--shared-counter`
+  the gateway's *own* restart resets the tally — see the limits below.)
 - **It's one policy across every framework, language and provider**, owned by
   the platform team, not scattered through app code.
 - **It leaves a receipt.** The same mechanism that blocks produces the
@@ -248,16 +248,55 @@ per refused call, and it is fail-open: a slow or dead webhook is logged and
 dropped, never allowed to touch a request. `AXIGATE_STOP_ALERT_URL` works in
 place of the flag.
 
+## Caps across gateway replicas
+
+One gateway keeps its tallies in memory. Two or more behind a load balancer
+would each count on their own, so a run could spend the cap once per replica.
+Point them at one Redis and they share a counter:
+
+```bash
+axigate-finops gateway --provider openai --max-spend-per-run 5 \
+  --shared-counter redis://cache.internal:6379
+```
+
+Every replica then reserves against the same tally in a single step that no
+other replica can slip between, so a burst spread across replicas trips the
+cap at the boundary exactly as one process does; a pause, a resume and the
+kill switch apply everywhere. The kill switch lives in the store, so it stays
+engaged across gateway restarts, for as long as the store keeps its data,
+until it is cleared. Nothing but run ids, counts, dollars, the attribution
+tags, why a run was paused, the kill switch and an id per call (kept with the
+run, so a retried write counts once) is stored. A run is remembered for two
+days of silence, its pause included. One Redis, not Redis Cluster.
+`rediss://` turns on TLS; a password goes in the URL, which anyone who can
+list processes on that host can read.
+
+If the store stops answering, or answers with an error, the gateway does not
+stop serving and does not stop capping: it decides per process until the
+store answers again, and says so. Rows decided that way carry `counter=local`,
+the status endpoint reports since when and how many decisions were made that
+way, and when the store returns the gap is written back to it: runs paused
+during it, the kill switch if an operator changed it, resumes an operator
+asked for, inline caps callers sent, and the cost of calls the store had
+already let through (the status field `owed_to_store` counts what is still
+owed). Spend tallied for calls this gateway let through on its own is not
+merged into the shared tally; that bound is approximate, by design, rather
+than a guess. A kill switch engaged before the gap is honoured during it, and
+so are the runs this gateway last saw paused in the store; a kill or a pause
+made on another replica during the gap is seen when the store returns.
+
 ## Honest about the limits
 
-- Per-run caps are enforced in memory: the gateway's own restart resets a run's
-  tally, and the cap is per-process (behind a load balancer each replica counts
-  on its own). Each call is reserved at admit — at the run's average cost so
+- Without `--shared-counter`, per-run caps are enforced in memory: the
+  gateway's own restart resets a run's tally, and the cap is per-process
+  (behind a load balancer each replica counts on its own). With or without
+  it, each call is reserved at admit — at the run's average cost so
   far, or at `--reserve-per-call` when that is higher — so a concurrent burst
   trips the cap at the boundary. Without that floor, the calls already in flight
   before a run's first cost is recorded can slip past the cap, because there is
-  no average to reserve against yet. For a sequential agent it is exact. A
-  durable, exact bound across replicas is the hosted tier's job, on the roadmap.
+  no average to reserve against yet. For a sequential agent it is exact. Run
+  more than one gateway? Give them one counter with `--shared-counter` (above)
+  and the cap holds across all of them.
 - A provider export shows spend, cache use and spikes, but not loops. Loops need
   the request-level data the gateway captures.
 - Nothing is signed below the `invoice-reconciled` state.

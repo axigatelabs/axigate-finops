@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,10 +23,10 @@ import (
 // far, or at ReserveUSDPerCall when that is higher — so a burst that hits a
 // cold run (no cost recorded yet, hence no average) is still bounded when the
 // operator sets a floor. Without a floor the residual bound is the calls
-// already in flight before the run's first cost is recorded; an exact bound
-// ACROSS processes is the durable shared store, lifted later with the paid
-// hosted tier. A request with no run id cannot be capped, the same honesty
-// as detection: a run is never inferred.
+// already in flight before the run's first cost is recorded. An exact bound
+// ACROSS processes is --shared-counter (counter_redis.go): the same rules run
+// as one script in a shared store, part of this binary. A request with no run
+// id cannot be capped, the same honesty as detection: a run is never inferred.
 
 // ControlPolicy configures enforcement. It is active only when a cap or the
 // pause-on-loop switch is set, so it is opt-in.
@@ -80,6 +81,11 @@ type StopEvent struct {
 	At       time.Time `json:"at"`
 }
 
+// micro is a dollar figure in whole micro-dollars. Cap comparisons happen at
+// this precision, in memory and in the shared store alike, so 0.7 + 0.1 meets
+// a $0.80 cap on every machine instead of depending on float rounding.
+func micro(v float64) int64 { return int64(math.Round(v * 1e6)) }
+
 // spendCapLocked returns the binding spend cap: the strictest of the server-wide
 // policy and the caller's inline X-AxiGate-Max-Spend, ignoring the ones left off.
 // The caller must hold c.mu.
@@ -111,6 +117,11 @@ type controller struct {
 	// invoked on its own goroutine, never under the lock and never in a request's
 	// path, so a slow or failing alert sink cannot affect a call.
 	onPause func(StopEvent)
+	// onPauseSync, when set, receives the same event synchronously, after the
+	// lock is released and before the call that caused it returns — for
+	// bookkeeping that must be in order with what the caller does next.
+	onPauseSync func(StopEvent)
+	pending     []StopEvent // stop events waiting for dispatch after the lock
 }
 
 func newController(p ControlPolicy) *controller {
@@ -152,12 +163,29 @@ func (c *controller) noteRun(run, agent, team, model string) {
 // holds c.mu; the alert is handed to its own goroutine so nothing here blocks.
 func (c *controller) pauseLocked(run string, st *runState, reason string) {
 	st.paused, st.reason = true, reason
-	if c.onPause != nil {
-		ev := StopEvent{
+	if c.onPause != nil || c.onPauseSync != nil {
+		c.pending = append(c.pending, StopEvent{
 			Run: run, Agent: st.agent, Team: st.team, Model: st.model,
 			Reason: reason, Calls: st.calls, SpendUSD: st.spendUSD, At: c.policy.Now().UTC(),
+		})
+	}
+}
+
+// dispatch hands out the stop events a call produced, once the lock is
+// released: the synchronous hook first, in order, then the alert on its own
+// goroutine. Deferred after the unlock in admit and record.
+func (c *controller) dispatch() {
+	c.mu.Lock()
+	evs, sync, async := c.pending, c.onPauseSync, c.onPause
+	c.pending = nil
+	c.mu.Unlock()
+	for _, ev := range evs {
+		if sync != nil {
+			sync(ev)
 		}
-		go c.onPause(ev)
+		if async != nil {
+			go async(ev)
+		}
 	}
 }
 
@@ -170,6 +198,7 @@ func (c *controller) pauseLocked(run string, st *runState, reason string) {
 // honest.
 func (c *controller) admit(run string, bypass bool) (bool, string) {
 	c.mu.Lock()
+	defer c.dispatch()
 	defer c.mu.Unlock()
 	if c.killed {
 		return false, "kill switch engaged"
@@ -208,7 +237,7 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 					perCall = avg
 				}
 			}
-			if st.spendUSD+perCall*float64(st.inflight) >= cap {
+			if micro(st.spendUSD+perCall*float64(st.inflight)) >= micro(cap) {
 				c.pauseLocked(run, st, "run reached the spend cap of "+money(cap))
 				return false, st.reason
 			}
@@ -226,6 +255,7 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		return
 	}
 	c.mu.Lock()
+	defer c.dispatch()
 	defer c.mu.Unlock()
 	st := c.runs[run]
 	if st == nil {
@@ -243,7 +273,7 @@ func (c *controller) record(run string, costUSD float64, suspectedLoop bool) {
 		switch {
 		case c.policy.MaxCallsPerRun > 0 && st.calls >= c.policy.MaxCallsPerRun:
 			c.pauseLocked(run, st, fmt.Sprintf("run reached the call cap of %d", c.policy.MaxCallsPerRun))
-		case spendCap > 0 && st.spendUSD >= spendCap:
+		case spendCap > 0 && micro(st.spendUSD) >= micro(spendCap):
 			c.pauseLocked(run, st, "run reached the spend cap of "+money(spendCap))
 		case suspectedLoop && c.policy.PauseOnSuspectedLoop:
 			c.pauseLocked(run, st, "suspected loop")
@@ -288,6 +318,19 @@ func (c *controller) setRunCap(run string, maxSpendUSD float64) {
 	c.evict()
 }
 
+// markPaused records a pause made elsewhere (the shared store, before a gap)
+// without alerting again: the fallback then refuses the run as the store did.
+func (c *controller) markPaused(run, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.runs[run]
+	if st == nil {
+		st = &runState{}
+		c.runs[run] = st
+	}
+	st.paused, st.reason = true, reason
+}
+
 // resumeRun clears a run's pause after review. Returns whether a paused run was
 // found.
 func (c *controller) resumeRun(run string) bool {
@@ -312,10 +355,11 @@ func (c *controller) setKilled(on bool) {
 
 // Status is a snapshot for the admin endpoint.
 type Status struct {
-	Killed     int          `json:"killed"` // 0 or 1, so the JSON is trivially machine-read
-	PausedRuns []PausedRun  `json:"paused_runs"`
-	Runs       int          `json:"runs_tracked"`
-	Policy     PolicyReport `json:"policy"`
+	Killed     int            `json:"killed"` // 0 or 1, so the JSON is trivially machine-read
+	PausedRuns []PausedRun    `json:"paused_runs"`
+	Runs       int            `json:"runs_tracked"`
+	Policy     PolicyReport   `json:"policy"`
+	Counter    *CounterReport `json:"counter,omitempty"` // present when a shared store is configured
 }
 
 // PausedRun reports one paused run without leaking anything but its id and why.
@@ -351,8 +395,12 @@ func (c *controller) status() Status {
 			s.PausedRuns = append(s.PausedRuns, PausedRun{Run: id, Reason: st.reason, Calls: st.calls, SpendUSD: st.spendUSD})
 		}
 	}
-	sort.Slice(s.PausedRuns, func(i, j int) bool { return s.PausedRuns[i].Run < s.PausedRuns[j].Run })
+	sortPaused(s.PausedRuns)
 	return s
+}
+
+func sortPaused(p []PausedRun) {
+	sort.Slice(p, func(i, j int) bool { return p[i].Run < p[j].Run })
 }
 
 // evict bounds the map. Paused runs are kept (they carry the reason an operator

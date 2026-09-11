@@ -31,14 +31,14 @@ func (g *Gateway) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		g.ctrl.setKilled(true)
-		writeJSON(w, http.StatusOK, map[string]any{"killed": true})
+		writeJSON(w, http.StatusOK, g.adminReply(map[string]any{"killed": true}))
 	case adminPrefix + "resume":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method", "POST to clear the kill switch")
 			return
 		}
 		g.ctrl.setKilled(false)
-		writeJSON(w, http.StatusOK, map[string]any{"killed": false})
+		writeJSON(w, http.StatusOK, g.adminReply(map[string]any{"killed": false}))
 	case adminPrefix + "runs/resume":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "method", "POST to resume a run")
@@ -49,10 +49,19 @@ func (g *Gateway) serveAdmin(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, "bad_request", "name the run to resume with ?run=<id>")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"run": run, "resumed": g.ctrl.resumeRun(run)})
+		writeJSON(w, http.StatusOK, g.adminReply(map[string]any{"run": run, "resumed": g.ctrl.resumeRun(run)}))
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// adminReply adds a note when an operator action could only be applied on this
+// gateway for now, because the shared counter is unreachable.
+func (g *Gateway) adminReply(m map[string]any) map[string]any {
+	if g.ctrl.pending() {
+		m["note"] = "part of what this gateway owes the shared store has not landed yet; it is written as soon as the store answers"
+	}
+	return m
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
