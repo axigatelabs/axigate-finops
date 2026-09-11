@@ -16,17 +16,26 @@ import (
 // The caps are cumulative per run and enforced in memory. A call is reserved at
 // admit — counted against the run before it is served — so a burst of concurrent
 // calls for one run trips the cap at the boundary instead of after ~concurrency
-// of overshoot. The residual bound is the calls already in flight before the
-// run's first cost is recorded (there is no average to reserve against yet); an
-// exact bound ACROSS processes is the durable shared store, lifted later with the
-// paid hosted tier. A request with no run id cannot be capped, the same honesty
+// of overshoot. Each in-flight call is reserved at the run's average cost so
+// far, or at ReserveUSDPerCall when that is higher — so a burst that hits a
+// cold run (no cost recorded yet, hence no average) is still bounded when the
+// operator sets a floor. Without a floor the residual bound is the calls
+// already in flight before the run's first cost is recorded; an exact bound
+// ACROSS processes is the durable shared store, lifted later with the paid
+// hosted tier. A request with no run id cannot be capped, the same honesty
 // as detection: a run is never inferred.
 
 // ControlPolicy configures enforcement. It is active only when a cap or the
 // pause-on-loop switch is set, so it is opt-in.
 type ControlPolicy struct {
-	MaxCallsPerRun       int
-	MaxSpendUSDPerRun    float64
+	MaxCallsPerRun    int
+	MaxSpendUSDPerRun float64
+	// ReserveUSDPerCall is the least a call is assumed to cost while it is in
+	// flight, for the spend-cap check. A run's first burst has no recorded cost
+	// to average, so without a floor every call in that burst is admitted; with
+	// one, the burst is refused once floor × in-flight would reach the cap. It
+	// never changes what is recorded — only what is reserved.
+	ReserveUSDPerCall    float64
 	PauseOnSuspectedLoop bool
 	// AdminToken guards the bypass header and the admin endpoints. Empty means
 	// no bypass and no admin channel (caps still work; a paused run then needs
@@ -177,11 +186,16 @@ func (c *controller) admit(run string, bypass bool) (bool, string) {
 			return false, st.reason
 		}
 		if cap := c.spendCapLocked(st); cap > 0 {
-			avg := 0.0
+			// Reserve each in-flight call at the run's average so far, or at
+			// the operator's floor when that is higher (a cold run has no
+			// average; a cheap start would otherwise under-reserve).
+			perCall := c.policy.ReserveUSDPerCall
 			if st.calls > 0 {
-				avg = st.spendUSD / float64(st.calls)
+				if avg := st.spendUSD / float64(st.calls); avg > perCall {
+					perCall = avg
+				}
 			}
-			if st.spendUSD+avg*float64(st.inflight) >= cap {
+			if st.spendUSD+perCall*float64(st.inflight) >= cap {
 				c.pauseLocked(run, st, fmt.Sprintf("run reached the spend cap of $%.2f", cap))
 				return false, st.reason
 			}
@@ -303,6 +317,7 @@ type PausedRun struct {
 type PolicyReport struct {
 	MaxCallsPerRun       int     `json:"max_calls_per_run"`
 	MaxSpendUSDPerRun    float64 `json:"max_spend_usd_per_run"`
+	ReserveUSDPerCall    float64 `json:"reserve_usd_per_call,omitempty"`
 	PauseOnSuspectedLoop bool    `json:"pause_on_suspected_loop"`
 }
 
@@ -312,6 +327,7 @@ func (c *controller) status() Status {
 	s := Status{Runs: len(c.runs), Policy: PolicyReport{
 		MaxCallsPerRun:       c.policy.MaxCallsPerRun,
 		MaxSpendUSDPerRun:    c.policy.MaxSpendUSDPerRun,
+		ReserveUSDPerCall:    c.policy.ReserveUSDPerCall,
 		PauseOnSuspectedLoop: c.policy.PauseOnSuspectedLoop,
 	}}
 	if c.killed {

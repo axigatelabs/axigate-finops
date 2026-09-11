@@ -219,9 +219,25 @@ type Summary struct {
 	LoopsBlocked int          `json:"loops_blocked"`
 	BlockedRuns  []BlockedRun `json:"blocked_runs"`
 	ByRun        []RunLine    `json:"by_run"` // top runs by spend — cost per run, not just per call
-	Daily        []DayPoint   `json:"daily"`
-	PeakDayUSD   float64      `json:"peak_day_usd"`
-	AvoidedUSD   float64      `json:"avoided_usd"`
+	// TotalState is the confidence state of TotalUSD: "estimated" when it is
+	// priced from tokens, "provider-reported" when a provider's own bill sets
+	// all of it, "mixed" when a bill covers some days and priced usage the
+	// rest. The team and agent figures stay estimated either way.
+	TotalState string `json:"total_state"`
+	// MeteredCalls is how many rows in the window came from metered calls
+	// rather than a provider's bill — zero for a ledger fed by imports alone.
+	MeteredCalls int `json:"metered_calls"`
+	// Teams and Agents count the named ones — the "(untagged)" and
+	// "(billed, not metered)" lines are rows in the lists, not teams.
+	Teams  int `json:"teams"`
+	Agents int `json:"agents"`
+	// UnmeteredUSD is what the provider's bill has that no metered call
+	// accounts for — traffic that went around the gateway, or a price the
+	// table has wrong. It is shown as one line, never spread across teams.
+	UnmeteredUSD float64    `json:"unmetered_usd"`
+	Daily        []DayPoint `json:"daily"`
+	PeakDayUSD   float64    `json:"peak_day_usd"`
+	AvoidedUSD   float64    `json:"avoided_usd"`
 }
 
 // RunLine is one run's rollup: what it spent, how many calls that took, how
@@ -242,6 +258,10 @@ type RunLine struct {
 // maxRunLines bounds the per-run rollup shown on the dashboard and in the API.
 const maxRunLines = 12
 
+// unmeteredKey is the by-team / by-agent line for spend the provider billed
+// that no call through the gateway accounts for.
+const unmeteredKey = "(billed, not metered)"
+
 func linesOf(m map[string]float64) []Line {
 	out := make([]Line, 0, len(m))
 	for k, v := range m {
@@ -261,10 +281,41 @@ func summaryOf(sc scope, reqDays int) Summary {
 	evs := inWindowOf(sc, from)
 	r := report.Build(evs)
 
+	// The team, agent, run, model and day figures come from metered calls —
+	// the gateway's priced rows and its refusals — never from a provider's
+	// bill: a bill row carries no team, agent or run, so letting it in would
+	// only turn known spend into "(untagged)". A bill row is attributed only
+	// when nothing metered exists for its provider and month (a ledger fed
+	// by imports alone). The total still comes from the report, where a bill
+	// sets the figure for the days it covers.
+	metered := report.Metered(evs)
+	meteredIn := map[string]bool{}
+	for _, e := range metered {
+		meteredIn[e.Provider+"|"+e.Period] = true
+	}
+	cov := report.CostCoverage(evs)
+	billed, coveredEst := map[string]float64{}, map[string]float64{} // provider|period
+	attributable := make([]ledger.Event, 0, len(evs))
+	for _, e := range evs {
+		key := e.Provider + "|" + e.Period
+		switch {
+		case report.IsCostRow(e):
+			billed[key] += e.CostUSD
+			if !meteredIn[key] {
+				attributable = append(attributable, e)
+			}
+		default:
+			attributable = append(attributable, e)
+			if cov.Covers(e) {
+				coveredEst[key] += e.CostUSD
+			}
+		}
+	}
+
 	byTeam, byAgent := map[string]float64{}, map[string]float64{}
 	byRun := map[string]int{}
 	blocked := 0
-	for _, e := range report.Included(evs) {
+	for _, e := range attributable {
 		if t := e.Tags.Team; t != "" {
 			byTeam[t] += e.CostUSD
 		} else {
@@ -284,7 +335,10 @@ func summaryOf(sc scope, reqDays int) Summary {
 	agentByRun, modelByRun := map[string]string{}, map[string]string{}
 	var globalSum float64
 	var globalCnt int
-	for _, e := range evs {
+	for _, e := range metered {
+		if e.Source != "gateway" {
+			continue // a run is a gateway concept; an imported usage bucket is not a call
+		}
 		if e.Dimensions["blocked"] != "" {
 			blocked++
 			byRun[e.Tags.Run]++
@@ -377,8 +431,53 @@ func summaryOf(sc scope, reqDays int) Summary {
 		byRunLines = byRunLines[:maxRunLines]
 	}
 
-	byDay := map[string]float64{}
+	// What the bill has that nothing metered accounts for, per provider and
+	// month, taken from the same rows the bars are built from (so a month of
+	// nothing but refusals still shows its bill): one line, so the bars add up
+	// to the total. Never spread across teams — that would be a guess. A bill
+	// below the estimate adds nothing.
+	var unmetered float64
+	for key, b := range billed {
+		if meteredIn[key] && b > coveredEst[key] {
+			unmetered += b - coveredEst[key]
+		}
+	}
+	if unmetered > 0 {
+		byTeam[unmeteredKey] += unmetered
+		byAgent[unmeteredKey] += unmetered
+	}
+	named := func(m map[string]float64) int {
+		n := 0
+		for k := range m {
+			if !strings.HasPrefix(k, "(") {
+				n++
+			}
+		}
+		return n
+	}
+	// The total's state: provider-reported only when every dollar in it is
+	// the provider's own figure; mixed when a bill covers some days and priced
+	// usage the rest; estimated when no bill is in.
+	var fromBill, fromUsage bool
 	for _, e := range report.Included(evs) {
+		if report.IsCostRow(e) {
+			fromBill = true
+		} else if e.CostUSD > 0 {
+			fromUsage = true
+		}
+	}
+	totalState := string(ledger.Estimated)
+	switch {
+	case fromBill && fromUsage:
+		totalState = "mixed"
+	case fromBill:
+		totalState = string(ledger.ProviderReported)
+	}
+
+	// The day chart is drawn from what was metered day by day; a monthly bill
+	// is not a day and must not appear as a spike on the 1st.
+	byDay := map[string]float64{}
+	for _, e := range attributable {
 		byDay[e.StartsAt.UTC().Format("2006-01-02")] += e.CostUSD
 	}
 	dayKeys := make([]string, 0, len(byDay))
@@ -395,12 +494,16 @@ func summaryOf(sc scope, reqDays int) Summary {
 		}
 	}
 	prov := map[string]float64{}
-	model := map[string]float64{}
 	for _, l := range r.ByProvider {
-		prov[l.Key] = l.USD
+		prov[l.Key] = l.USD // a bill is per provider, so provider totals may use it
 	}
-	for _, l := range r.ByModel {
-		model[l.Key] = l.USD
+	model := map[string]float64{}
+	for _, e := range attributable {
+		k := e.Model
+		if k == "" {
+			k = "(not grouped by model)"
+		}
+		model[k] += e.CostUSD
 	}
 	start := sc.earliest
 	if !from.IsZero() && from.After(sc.earliest) {
@@ -412,6 +515,7 @@ func summaryOf(sc scope, reqDays int) Summary {
 		Events: len(evs), TotalUSD: r.TotalUSD,
 		ByProvider: linesOf(prov), ByTeam: linesOf(byTeam), ByAgent: linesOf(byAgent), ByModel: linesOf(model),
 		LoopsBlocked: blocked, BlockedRuns: runs, ByRun: byRunLines,
+		TotalState: totalState, MeteredCalls: len(metered), UnmeteredUSD: unmetered, Teams: named(byTeam), Agents: named(byAgent),
 		Daily: daily, PeakDayUSD: peak, AvoidedUSD: avoidedTotal,
 	}
 }

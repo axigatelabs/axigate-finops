@@ -182,7 +182,7 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="total">
     <div class="eyebrow">Total spend</div>
     <div class="big">{{usd .Sum.TotalUSD}}</div>
-    <div class="meta"><b>{{len .Sum.ByProvider}}</b> provider(s) · <b>{{len .Sum.ByModel}}</b> model(s)<br>every figure is the <span class="num">estimated</span> state</div>
+    <div class="meta"><b>{{len .Sum.ByProvider}}</b> provider(s) · <b>{{len .Sum.ByModel}}</b> model(s)<br>{{if eq .Sum.TotalState "estimated"}}every figure is the <span class="num">estimated</span> state{{else}}total is {{if eq .Sum.TotalState "mixed"}}part <span class="num">provider-reported</span>, part <span class="num">estimated</span>{{else}}the <span class="num">provider-reported</span> state{{end}}{{if .Sum.MeteredCalls}} · the team and agent figures are the gateway's <span class="num">estimated</span> state{{end}}{{end}}</div>
   </div>
   <div class="plot">
     <div class="head"><div class="eyebrow">Spend over time</div><div class="peak">peak day <b>{{usd .Sum.PeakDayUSD}}</b></div></div>
@@ -192,8 +192,8 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <div class="chips">
   <div class="chip danger"><span class="ic">` + iconStop + `</span><div><div class="v">{{.Sum.LoopsBlocked}}</div><div class="l">Runaway calls blocked</div></div></div>
-  <div class="chip n"><span class="ic">` + iconTeam + `</span><div><div class="v">{{len .Sum.ByTeam}}</div><div class="l">Teams</div></div></div>
-  <div class="chip n"><span class="ic">` + iconBot + `</span><div><div class="v">{{len .Sum.ByAgent}}</div><div class="l">Agents</div></div></div>
+  <div class="chip n"><span class="ic">` + iconTeam + `</span><div><div class="v">{{.Sum.Teams}}</div><div class="l">Teams</div></div></div>
+  <div class="chip n"><span class="ic">` + iconBot + `</span><div><div class="v">{{.Sum.Agents}}</div><div class="l">Agents</div></div></div>
 </div>
 
 <div class="grid2">
@@ -204,6 +204,7 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     {{range .Sum.ByAgent}}<div class="bar"><div class="lbl"><div class="nm">{{.Key}}</div><div class="track"><span class="fill" style="{{barWidth .USD $.MaxAgent}}"></span></div></div><div class="amt">{{usd .USD}}</div></div>{{else}}<div class="empty">No spend in this range.</div>{{end}}
   </div>
 </div>
+{{if gt .Sum.UnmeteredUSD 0.0}}<p class="foot" style="margin:0 0 16px"><span class="num">(billed, not metered)</span> is {{usd .Sum.UnmeteredUSD}} on the provider's bill that nothing metered accounts for — traffic that went around the gateway, or a price in the price list that is wrong. It stays its own line; it is never spread across teams or agents.</p>{{end}}
 
 <div class="card runs" style="margin-bottom:16px"><h2>Spend by run <span class="ct">top {{len .Sum.ByRun}} by spend</span></h2>
   {{range .Sum.ByRun}}<div class="run-row">
@@ -232,7 +233,7 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 </div>
 
-<p class="foot">Totals, the FOCUS export and the statement all come from one Go implementation, so this dashboard can never disagree with a download. Spend on ids with no owner is shown as <span class="mono">unknown</span>, never guessed.</p>
+<p class="foot">Totals and the FOCUS export come from one Go implementation, so this dashboard can never disagree with that download; the statement lists every row, usage and bill, each with its confidence state. Spend on ids with no owner is shown as <span class="mono">unknown</span>, never guessed.</p>
 </div></body></html>`
 
 const runHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">

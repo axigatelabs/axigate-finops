@@ -10,6 +10,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/axigatelabs/axigate-finops/internal/ledger"
 	"github.com/axigatelabs/axigate-finops/internal/pricing"
@@ -73,26 +74,69 @@ type Report struct {
 	Notes           []string
 }
 
-// costRowsPresent tells whether a provider has its own cost rows, in which
-// case the totals use those and the usage rows are token detail only, so a
-// provider is never counted twice.
-func costRowsPresent(events []ledger.Event) map[string]bool {
-	present := map[string]bool{}
-	for _, e := range events {
-		if e.Confidence.AtLeast(ledger.ProviderReported) && e.Usage == (ledger.Usage{}) {
-			present[e.Provider] = true
-		}
-	}
-	return present
+// IsCostRow says whether an event is a provider's own cost figure — dollars in
+// the provider-reported state with no token usage behind them — rather than a
+// metered call. A cost row can set a total; it can never be attributed to a
+// team, an agent or a run, because the provider does not know them.
+func IsCostRow(e ledger.Event) bool {
+	return e.Usage == (ledger.Usage{}) && e.Confidence.AtLeast(ledger.ProviderReported)
 }
 
-// countsTowardTotal says whether an event's dollars belong in the totals.
-func countsTowardTotal(e ledger.Event, hasCost map[string]bool) bool {
-	isCostRow := e.Usage == (ledger.Usage{}) && e.Confidence.AtLeast(ledger.ProviderReported)
-	if hasCost[e.Provider] {
-		return isCostRow
+// Metered returns the events that describe individual calls — priced usage
+// rows and the gateway's refusals — leaving provider cost rows out. Anything
+// attributed (by team, agent, run, model or day) is built from these.
+func Metered(events []ledger.Event) []ledger.Event {
+	out := make([]ledger.Event, 0, len(events))
+	for _, e := range events {
+		if !IsCostRow(e) {
+			out = append(out, e)
+		}
 	}
-	return true
+	return out
+}
+
+// Coverage is the set of provider-days a provider's own cost rows cover. A
+// bill replaces the priced usage rows inside its own bucket and no others: a
+// daily cost page imported mid-month sets the total for the days it holds and
+// the gateway's later days stay priced usage, and last month's bill never
+// silences this month's live rows.
+type Coverage map[string]bool
+
+const maxCoverageDays = 400 // a cost row's bucket is a day or a month; anything longer is malformed
+
+func coverageKey(provider string, t time.Time) string {
+	return provider + "|" + t.UTC().Format("2006-01-02")
+}
+
+// CostCoverage reads the days covered by every cost row in events. EndsAt is
+// exclusive, the way the importers write buckets; a row with no span covers
+// its start day.
+func CostCoverage(events []ledger.Event) Coverage {
+	cov := Coverage{}
+	for _, e := range events {
+		if !IsCostRow(e) {
+			continue
+		}
+		start := e.StartsAt.UTC().Truncate(24 * time.Hour)
+		end := e.EndsAt.UTC()
+		if !end.After(start) {
+			end = start.Add(24 * time.Hour)
+		}
+		for d, n := start, 0; d.Before(end) && n < maxCoverageDays; d, n = d.Add(24*time.Hour), n+1 {
+			cov[coverageKey(e.Provider, d)] = true
+		}
+	}
+	return cov
+}
+
+// Covers says whether a provider's own cost rows cover the day this event
+// falls on, in which case the event's dollars are token detail only.
+func (c Coverage) Covers(e ledger.Event) bool { return c[coverageKey(e.Provider, e.StartsAt)] }
+
+// countsTowardTotal says whether an event's dollars belong in the totals: a
+// cost row always, a usage row only on days no cost row covers.
+func countsTowardTotal(e ledger.Event, cov Coverage) bool {
+	return IsCostRow(e) || !cov.Covers(e)
 }
 
 func ownerKey(t ledger.Tags) string {
@@ -152,15 +196,16 @@ func add(m map[string]*acc, key string, e ledger.Event) {
 	a.n++
 }
 
-// Included returns the events whose dollars count toward the total: when a
-// provider has its own cost rows those drive its total and its usage rows are
-// token detail only, so a provider is never counted twice. Exports (FOCUS, the
-// statement) use this so their sums match the report total to the cent.
+// Included returns the events whose dollars count toward the total: on the
+// days a provider's own cost rows cover, those drive the total and the usage
+// rows are token detail only, so nothing is counted twice; on every other day
+// the priced usage rows count. Exports (FOCUS) use this so their sums match
+// the report total to the cent.
 func Included(events []ledger.Event) []ledger.Event {
-	hasCost := costRowsPresent(events)
+	cov := CostCoverage(events)
 	out := make([]ledger.Event, 0, len(events))
 	for _, e := range events {
-		if countsTowardTotal(e, hasCost) {
+		if countsTowardTotal(e, cov) {
 			out = append(out, e)
 		}
 	}
@@ -171,7 +216,7 @@ func Included(events []ledger.Event) []ledger.Event {
 // runs live in a different report because they need a different source.
 func Build(events []ledger.Event) Report {
 	var r Report
-	hasCost := costRowsPresent(events)
+	cov := CostCoverage(events)
 	// Spikes are read from the most granular rows a provider has: usage rows
 	// carry keys and models per day, cost rows only projects and line items.
 	hasUsage := map[string]bool{}
@@ -210,7 +255,9 @@ func Build(events []ledger.Event) Report {
 				add(byUnlisted, e.Provider+"/"+e.Model, e)
 			}
 			c.UncachedUSD += pricing.Price(e.Provider, e.Model, pricing.Usage{InputTokens: uncachedOnly(e)}).USD
-			est[e.Provider+"|"+e.Period] += e.CostUSD
+			if cov.Covers(e) { // reconcile like with like: only the days the bill covers
+				est[e.Provider+"|"+e.Period] += e.CostUSD
+			}
 		} else if e.Confidence.AtLeast(ledger.ProviderReported) {
 			rep[e.Provider+"|"+e.Period] += e.CostUSD
 		}
@@ -227,7 +274,7 @@ func Build(events []ledger.Event) Report {
 				}
 			}
 		}
-		if !countsTowardTotal(e, hasCost) {
+		if !countsTowardTotal(e, cov) {
 			continue
 		}
 		r.TotalUSD += e.CostUSD
@@ -322,8 +369,22 @@ func Build(events []ledger.Event) Report {
 		return r.Reconciliations[i].Period < r.Reconciliations[j].Period
 	})
 
-	for p := range hasCost {
-		r.Notes = append(r.Notes, fmt.Sprintf("%s: totals use the provider's own cost report; usage rows supply the token detail", p))
+	// One note per billed provider, naming the months its cost report sets.
+	billedMonths := map[string]map[string]bool{}
+	for key := range cov {
+		p, day, _ := strings.Cut(key, "|")
+		if billedMonths[p] == nil {
+			billedMonths[p] = map[string]bool{}
+		}
+		billedMonths[p][day[:7]] = true
+	}
+	for p, months := range billedMonths {
+		ms := make([]string, 0, len(months))
+		for m := range months {
+			ms = append(ms, m)
+		}
+		sort.Strings(ms)
+		r.Notes = append(r.Notes, fmt.Sprintf("%s: the provider's own cost report sets the total for the days it covers (%s); usage rows supply the token detail there and the total elsewhere", p, strings.Join(ms, ", ")))
 	}
 	sort.Strings(r.Notes)
 	return r
