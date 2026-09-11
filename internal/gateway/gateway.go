@@ -73,14 +73,22 @@ type Config struct {
 	// StopAlertURL, when set, receives a metadata-only JSON POST the moment the
 	// gateway stops a run (Slack/Discord webhook URLs work as-is). Fail-open.
 	StopAlertURL string
+	// SharedCounter, when set, is a redis:// or rediss:// URL: run tallies live
+	// there, so caps, pauses and the kill switch hold across every gateway
+	// replica. Empty means the per-process in-memory counter. New starts a
+	// background probe for it, stopped by Close.
+	SharedCounter string
 }
 
 // Gateway is an http.Handler that proxies to one provider.
 type Gateway struct {
 	cfg  Config
 	seq  atomic.Uint64
-	det  *detector   // nil when loop detection is off
-	ctrl *controller // nil when loop control is off
+	det  *detector // nil when loop detection is off
+	ctrl budget    // nil when loop control is off
+	// counterErr is a shared-counter configuration mistake found at boot (a
+	// store that answered with an error); the command refuses to start on it.
+	counterErr error
 }
 
 // New returns a Gateway, filling defaults.
@@ -112,9 +120,16 @@ func New(cfg Config) *Gateway {
 		if cfg.Control.Now == nil {
 			cfg.Control.Now = cfg.Now
 		}
-		g.ctrl = newController(cfg.Control)
+		g.ctrl = memoryBudget{newController(cfg.Control)}
+		if cfg.SharedCounter != "" {
+			if sc, err := newSharedCounter(cfg.Control, cfg.SharedCounter); err != nil {
+				g.counterErr = err // a configuration mistake: the caller refuses to start
+			} else {
+				g.ctrl = sc
+			}
+		}
 		if cfg.StopAlertURL != "" {
-			g.ctrl.onPause = newStopAlertSender(cfg.StopAlertURL)
+			g.ctrl.setOnPause(newStopAlertSender(cfg.StopAlertURL))
 		}
 	}
 	return g
@@ -180,6 +195,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Loop control refuses a paused or killed request before it leaves. A
 	// bypass credential forces one request through a per-run pause.
+	counter := "" // how the cap decision was made, stamped on the row: "shared" or "local" when a shared store is configured
 	if g.ctrl != nil {
 		// Note who this run belongs to, so a stop alert can name the agent/team.
 		t := tagsFromHeaders(r.Header)
@@ -192,12 +208,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		bypass := g.cfg.Control.AdminToken != "" && r.Header.Get("X-AxiGate-Bypass") == g.cfg.Control.AdminToken
-		if ok, reason := g.ctrl.admit(run, bypass); !ok {
+		ok, reason, where := g.ctrl.admitWhere(run, bypass)
+		counter = where // the settlement goes back to the counter that decided; the row carries counterLabel(where)
+		if !ok {
 			code, typ := http.StatusTooManyRequests, "run_paused"
 			if reason == "kill switch engaged" {
 				code, typ = http.StatusServiceUnavailable, "killed"
 			}
-			g.recordBlocked(r, model, run, reason, code, start)
+			g.recordBlocked(r, model, run, reason, code, start, counterLabel(counter))
 			fmt.Fprintf(os.Stderr, "gateway: refused (%s) run=%q: %s\n", typ, run, reason)
 			writeJSONError(w, code, typ, "axigate gateway: "+reason)
 			return
@@ -211,7 +229,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(reqBody))
 	if err != nil {
 		if g.ctrl != nil { // the call was admitted but never left; free its reservation
-			g.ctrl.release(run)
+			g.ctrl.release(run, counter)
 		}
 		http.Error(w, "gateway: bad request: "+err.Error(), http.StatusBadGateway)
 		return
@@ -225,7 +243,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// sees the failure. We do not record a cost for a call that never billed,
 		// so free the admit-time reservation instead.
 		if g.ctrl != nil {
-			g.ctrl.release(run)
+			g.ctrl.release(run, counter)
 		}
 		http.Error(w, "gateway: upstream unreachable: "+err.Error(), http.StatusBadGateway)
 		return
@@ -263,7 +281,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// From here on nothing may affect the response: it is already sent.
-	g.record(r, resp.StatusCode, streamed, model2, usage, gotUsage, start, dec)
+	g.record(r, resp.StatusCode, streamed, model2, usage, gotUsage, start, dec, counter)
 }
 
 // parseMoney reads a dollar amount from a header like "5.00" or "$5". A
@@ -293,10 +311,7 @@ func signature(provider, model string, body []byte) string {
 
 // record builds one metadata-only event and hands it to the recorder. It never
 // returns an error: recording is best-effort by contract.
-func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model string, usage ledger.Usage, gotUsage bool, start time.Time, dec Decision) {
-	if g.cfg.Recorder == nil {
-		return
-	}
+func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model string, usage ledger.Usage, gotUsage bool, start time.Time, dec Decision, counter string) {
 	// Fail open: a misbehaving recorder must never surface on the response
 	// path, which by this point has already been fully written anyway.
 	defer func() { _ = recover() }()
@@ -321,6 +336,9 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 		}
 	}
 	identityFromHeaders(r.Header).dims(dims)
+	if l := counterLabel(counter); l != "" {
+		dims["counter"] = l
+	}
 
 	e := ledger.Event{
 		Source:     SourceGateway,
@@ -349,19 +367,22 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 		e.EndsAt = e.StartsAt
 	}
 	e.DeriveID()
-	g.cfg.Recorder.Record(e)
-
-	// Tally the completed request; this is what pauses a run that just crossed
-	// a cap or tripped the loop signal, so the next request is refused.
+	// Settle the completed request with its counter first — this is what
+	// pauses a run that just crossed a cap or tripped the loop signal, so the
+	// next request is refused — and only then hand the row to the recorder,
+	// whose failure must never leave the reservation in flight.
 	if g.ctrl != nil {
-		g.ctrl.record(e.Tags.Run, e.CostUSD, dec.Suspected)
+		g.ctrl.record(e.Tags.Run, e.CostUSD, dec.Suspected, counter)
+	}
+	if g.cfg.Recorder != nil {
+		g.cfg.Recorder.Record(e)
 	}
 }
 
 // recordBlocked writes an event for a request the gateway refused, so the
 // ledger shows enforcement, not a silent gap. No provider call was made, so
 // there is no usage and no cost.
-func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code int, start time.Time) {
+func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code int, start time.Time, counter string) {
 	if g.cfg.Recorder == nil {
 		return
 	}
@@ -372,6 +393,9 @@ func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code
 		"blocked":    reason,
 	}
 	identityFromHeaders(r.Header).dims(dims)
+	if counter != "" {
+		dims["counter"] = counter
+	}
 	e := ledger.Event{
 		Source: SourceGateway, Provider: g.cfg.Provider, Model: model, Dimensions: dims,
 		Usage: ledger.Usage{}, Tags: tagsFromHeaders(r.Header),
@@ -379,6 +403,31 @@ func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code
 	}
 	e.DeriveID()
 	g.cfg.Recorder.Record(e)
+}
+
+// Close stops the shared counter's background probe, if there is one. A
+// gateway that serves for the life of the process need not call it.
+func (g *Gateway) Close() {
+	if sc, ok := g.ctrl.(*sharedCounter); ok {
+		sc.close()
+	}
+}
+
+// CounterError is the shared-counter configuration mistake found at boot, if any.
+func (g *Gateway) CounterError() error { return g.counterErr }
+
+// CounterLine says where run tallies live right now, for the startup message.
+func (g *Gateway) CounterLine() string {
+	if g.ctrl == nil {
+		return "off (no cap or loop control configured)"
+	}
+	switch g.ctrl.mode() {
+	case "shared":
+		return "shared at " + redact(g.cfg.SharedCounter) + " (caps hold across replicas; falls back per process if it is unreachable)"
+	case "local":
+		return "shared at " + redact(g.cfg.SharedCounter) + " — unreachable right now, deciding per process (approximate) until it returns"
+	}
+	return "per process, in memory (approximate across replicas)"
 }
 
 // tagsFromHeaders reads the caller's own attribution off X-AxiGate-* headers,

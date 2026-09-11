@@ -282,8 +282,14 @@ func doGateway(args []string) error {
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints (empty = no bypass, no admin)")
 	requestCaps := fs.Bool("request-caps", true, "honor a caller's X-AxiGate-Max-Spend header as a per-run spend cap set from code")
 	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
+	sharedCounter := fs.String("shared-counter", "", "redis:// or rediss:// URL to keep run tallies in, so caps hold across gateway replicas (empty = per-process, in memory)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *sharedCounter != "" {
+		if err := gateway.CheckSharedCounterURL(*sharedCounter); err != nil {
+			return err
+		}
 	}
 	base := *upstream
 	switch *provider {
@@ -308,10 +314,13 @@ func doGateway(args []string) error {
 	}
 	defer f.Close()
 	gw := gateway.New(gateway.Config{
-		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"), SharedCounter: *sharedCounter,
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
 		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: *requestCaps},
 	})
+	if err := gw.CounterError(); err != nil {
+		return err
+	}
 
 	srv := &http.Server{Addr: *listen, Handler: gw, ReadHeaderTimeout: 30 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 120 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -329,8 +338,8 @@ func doGateway(args []string) error {
 			ctrlMsg += " — no admin token: a paused run needs a restart to clear"
 		}
 	}
-	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  point your app's base URL at http://%s and keep your normal key\n  Claude Code: set ANTHROPIC_BASE_URL to it — each session is a run, nothing to tag\n",
-		*listen, base, *provider, *ledgerPath, loopMsg, ctrlMsg, *listen)
+	fmt.Printf("axigate-finops gateway: %s -> %s (%s)\n  events: %s\n  loop detection: %s\n  loop control: %s\n  counter: %s\n  point your app's base URL at http://%s and keep your normal key\n  Claude Code: set ANTHROPIC_BASE_URL to it — each session is a run, nothing to tag\n",
+		*listen, base, *provider, *ledgerPath, loopMsg, ctrlMsg, gw.CounterLine(), *listen)
 	select {
 	case err := <-errc:
 		return err
@@ -362,8 +371,14 @@ func doServe(args []string) error {
 	pauseOnLoop := fs.Bool("pause-on-loop", false, "pause a run as soon as a loop is suspected (needs loop detection on)")
 	adminToken := fs.String("admin-token", "", "token for the bypass header and the /_axigate control endpoints")
 	stopAlertURL := fs.String("stop-alert-url", "", "webhook to POST when a run is stopped — a Slack/Discord incoming-webhook URL works as-is (or set AXIGATE_STOP_ALERT_URL); metadata only, fail-open")
+	sharedCounter := fs.String("shared-counter", "", "redis:// or rediss:// URL to keep run tallies in, so caps hold across gateway replicas (empty = per-process, in memory)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *sharedCounter != "" {
+		if err := gateway.CheckSharedCounterURL(*sharedCounter); err != nil {
+			return err
+		}
 	}
 	base := *upstream
 	switch *provider {
@@ -388,10 +403,13 @@ func doServe(args []string) error {
 	}
 	defer f.Close()
 	gw := gateway.New(gateway.Config{
-		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"),
+		Upstream: base, Provider: *provider, Recorder: gateway.NewJSONLRecorder(f), StopAlertURL: envOr(*stopAlertURL, "AXIGATE_STOP_ALERT_URL"), SharedCounter: *sharedCounter,
 		Loop:    gateway.LoopPolicy{Window: *loopWindow, MaxPerRun: *loopMaxReq, MaxRepeat: *loopMaxRep},
 		Control: gateway.ControlPolicy{MaxCallsPerRun: *maxCalls, MaxSpendUSDPerRun: *maxSpend, ReserveUSDPerCall: *reservePerCall, PauseOnSuspectedLoop: *pauseOnLoop, AdminToken: *adminToken, AllowRequestCaps: true},
 	})
+	if err := gw.CounterError(); err != nil {
+		return err
+	}
 	con := console.New(nil)
 	con.SetLedgerFile(*ledgerPath) // live: the dashboard re-reads the shared ledger per request
 
@@ -407,8 +425,9 @@ func doServe(args []string) error {
 		"  dashboard  http://%s   → open in a browser; spend appears live\n"+
 		"  ledger     %s (metadata only)\n"+
 		"  inline cap: set X-AxiGate-Run and X-AxiGate-Max-Spend in your code to cap a run, no restart\n"+
-		"  Claude Code: set ANTHROPIC_BASE_URL to the gateway — each session is a run, nothing to tag\n",
-		*provider, *gwListen, *consoleListen, *ledgerPath)
+		"  Claude Code: set ANTHROPIC_BASE_URL to the gateway — each session is a run, nothing to tag\n"+
+		"  counter:    %s\n",
+		*provider, *gwListen, *consoleListen, *ledgerPath, gw.CounterLine())
 	select {
 	case err := <-errc:
 		return err

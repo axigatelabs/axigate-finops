@@ -536,3 +536,44 @@ func TestClaudeCodeSessionIsARunWithNothingToTag(t *testing.T) {
 		t.Fatalf("another session must not be refused, got %d", resp.StatusCode)
 	}
 }
+
+// A recorder that panics must not keep the run's reservation in flight: the
+// counter is settled before the row is handed to the recorder.
+func TestARecorderPanicStillSettlesTheCounter(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"gpt-4o","choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":10}}`))
+	}))
+	defer up.Close()
+	gw := New(Config{Upstream: up.URL, Provider: "openai", Recorder: panicRecorder{}, Now: fixedClock(),
+		Control: ControlPolicy{MaxCallsPerRun: 2, Now: fixedClock()}})
+	front := httptest.NewServer(gw)
+	defer front.Close()
+	call := func() int {
+		req, _ := http.NewRequest("POST", front.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`))
+		req.Header.Set("X-AxiGate-Run", "r")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if c := call(); c != 200 {
+		t.Fatalf("first call: %d", c)
+	}
+	if c := call(); c != 200 {
+		t.Fatalf("second call (the cap of 2 is reached on it, not before): %d", c)
+	}
+	if c := call(); c != 429 {
+		t.Fatalf("third call should be refused by the call cap, got %d — the settlement was skipped", c)
+	}
+	st := gw.ctrl.status()
+	if len(st.PausedRuns) != 1 || st.PausedRuns[0].Calls != 2 {
+		t.Fatalf("both calls must be counted despite the recorder panicking: %+v", st.PausedRuns)
+	}
+}
+
+type panicRecorder struct{}
+
+func (panicRecorder) Record(ledger.Event) { panic("recorder is broken") }
