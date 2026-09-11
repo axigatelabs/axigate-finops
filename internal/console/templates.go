@@ -98,9 +98,13 @@ a{color:inherit;text-decoration:none}
 .loop-row .right{margin-left:auto;text-align:right;flex:0 0 auto}
 .loop-row .warn{font-family:var(--mono);font-size:12px;color:var(--danger);background:color-mix(in srgb,var(--danger) 13%,transparent);padding:5px 11px;border-radius:999px;white-space:nowrap;display:inline-block}
 .loop-row .avoided{font-family:var(--mono);font-size:11.5px;color:var(--money);margin-top:6px}
+.loop-row .spent{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin-top:6px}
+.loops>h2 .lost{margin-left:auto;font-family:var(--mono);font-size:11.5px;font-weight:500;color:var(--danger);
+  background:color-mix(in srgb,var(--danger) 12%,transparent);padding:5px 11px;border-radius:999px}
 .loop-row .rr{width:8px;height:8px;border-radius:50%;background:var(--danger);flex:0 0 auto;box-shadow:0 0 0 4px color-mix(in srgb,var(--danger) 16%,transparent)}
 .loop-row .chev{color:var(--ink-3);font-size:18px;margin-left:2px;transition:color .15s,transform .15s}
 .loop-row:hover{border-radius:10px;background:color-mix(in srgb,var(--danger) 6%,transparent)}
+.loop-row.still:hover{border-radius:0;background:none}
 .loop-row:hover .chev{color:var(--danger);transform:translateX(2px)}
 
 /* per-run rollup: same layout as a loop row, neutral (spend, not danger) */
@@ -192,6 +196,7 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <div class="chips">
   <div class="chip danger"><span class="ic">` + iconStop + `</span><div><div class="v">{{.Sum.LoopsBlocked}}</div><div class="l">Runaway calls blocked</div></div></div>
+  {{if .Sum.ShadowCalls}}<div class="chip danger"><span class="ic">` + iconStop + `</span><div><div class="v">{{.Sum.ShadowCalls}}</div><div class="l">Would have been refused (shadow mode)</div></div></div>{{end}}
   <div class="chip n"><span class="ic">` + iconTeam + `</span><div><div class="v">{{.Sum.Teams}}</div><div class="l">Teams</div></div></div>
   <div class="chip n"><span class="ic">` + iconBot + `</span><div><div class="v">{{.Sum.Agents}}</div><div class="l">Agents</div></div></div>
 </div>
@@ -215,7 +220,24 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
     </div>{{else}}<div class="empty">No runs in this range. Tag calls with <span class="num">X-AxiGate-Run</span> and each run rolls up here — spend, calls, failures and refusals in one line.</div>{{end}}
 </div>
 
-<div class="card loops" style="margin-bottom:16px"><h2>Runaway loops the gateway stopped
+{{if .Sum.ByKey}}<div class="card runs" style="margin-bottom:16px"><h2>Spend by key <span class="ct">top {{len .Sum.ByKey}} by spend</span></h2>
+  {{range .Sum.ByKey}}<div class="run-row">
+      <div class="who"><div class="rid"><span class="num">key {{.Label}}</span></div>
+        <div class="meta"><span class="num">{{.Calls}}</span> calls{{if .Failed}} · <span class="num">{{.Failed}}</span> failed{{end}}{{if .Blocked}} · <span class="num">{{.Blocked}}</span> refused{{end}}</div></div>
+      <div class="right"><div class="amt">{{usd .SpentUSD}}</div></div>
+    </div>{{end}}
+  <p class="foot" style="margin:8px 0 0">The gateway keeps a fingerprint of each API key, never the key. A key you do not recognise spending here is the first sign of a leak; <span class="num">--max-spend-per-key-day</span> and <span class="num">--max-spend-per-key</span> cap what any one key may spend.</p>
+</div>
+{{end}}
+{{if .Sum.ShadowLines}}<div class="card loops" style="margin-bottom:16px"><h2>Shadow mode: what a cap would have stopped <span class="lost">{{usd .Sum.ShadowSpendUSD}} spent past the caps</span></h2>
+  {{range .Sum.ShadowLines}}{{if eq .Kind "run"}}<a class="loop-row" href="/run/{{urlquery .Who}}">{{else}}<div class="loop-row still">{{end}}
+      <span class="rr"></span>
+      <div class="who"><div class="rid">{{if eq .Kind "run"}}{{.Who}}{{else}}<span class="num">{{.Who}}</span>{{end}}</div><div class="meta">{{if .Agent}}{{.Agent}}{{else}}unknown agent{{end}}{{if .Model}} · <span class="num">{{.Model}}</span>{{end}} · {{.Reason}}</div></div>
+      <div class="right"><div class="warn">{{.Calls}} call{{if ne .Calls 1}}s{{end}} past the cap</div><div class="spent">{{usd .SpentUSD}} spent</div></div>
+      {{if eq .Kind "run"}}<span class="chev">›</span></a>{{else}}</div>{{end}}{{end}}
+  <p class="foot" style="margin-top:14px">In shadow mode every call is served; the ones a cap would have refused are marked, and the alert says "would have stopped". These dollars were spent. Start the gateway without <span class="num">--shadow</span> to enforce: with <span class="num">--shared-counter</span> a run or key already past its cap is refused from the restart on; without it the tallies start again from zero, and a run or key is refused when it reaches its cap again.</p>
+</div>
+{{end}}<div class="card loops" style="margin-bottom:16px"><h2>Runaway loops the gateway stopped
     {{if .Sum.BlockedRuns}}<span class="saved">≈{{usd .Sum.AvoidedUSD}} of runaway spend prevented</span>{{end}}</h2>
   {{if .Sum.BlockedRuns}}{{range .Sum.BlockedRuns}}<a class="loop-row" href="/run/{{urlquery .Run}}">
       <span class="rr"></span>
@@ -249,23 +271,24 @@ const runHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div class="rhead">
   <div><div class="rid">{{.Run}}</div>
     <div class="meta">{{if .Agent}}{{.Agent}}{{else}}unknown agent{{end}}{{if .Team}} · {{.Team}}{{end}} · {{.Provider}} · <span class="num">{{.Model}}</span></div></div>
-  {{if .Paused}}<span class="pill" style="color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent);background:color-mix(in srgb,var(--danger) 12%,transparent)"><span class="dot"></span>paused by the gateway</span>{{end}}
+  {{if .Paused}}<span class="pill" style="color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent);background:color-mix(in srgb,var(--danger) 12%,transparent)"><span class="dot"></span>paused by the gateway</span>{{else if .ShadowN}}<span class="pill" style="color:var(--danger);border-color:color-mix(in srgb,var(--danger) 45%,transparent);background:color-mix(in srgb,var(--danger) 12%,transparent)"><span class="dot"></span>would have been paused (shadow mode)</span>{{end}}
 </div>
 
 <div class="rstat">
   <div class="s"><div class="l">Spent</div><div class="v">{{usd .SpentUSD}}</div><div class="sub">{{.OK}} calls served</div></div>
-  <div class="s"><div class="l">Calls</div><div class="v">{{.Total}}</div><div class="sub">{{.BlockedN}} blocked · {{.FlaggedN}} flagged</div></div>
-  <div class="s saved"><div class="l">Prevented spend</div><div class="v">≈{{usd .AvoidedUSD}}</div><div class="sub">{{.BlockedN}} calls refused before the provider</div></div>
+  <div class="s"><div class="l">Calls</div><div class="v">{{.Total}}</div><div class="sub">{{.BlockedN}} blocked · {{.FlaggedN}} flagged{{if .ShadowN}} · {{.ShadowN}} would have been refused{{end}}</div></div>
+  {{if and .ShadowN (not .BlockedN)}}<div class="s"><div class="l">Spent past the cap</div><div class="v">{{usd .ShadowUSD}}</div><div class="sub">{{.ShadowN}} calls served in shadow mode</div></div>{{else}}<div class="s saved"><div class="l">Prevented spend</div><div class="v">≈{{usd .AvoidedUSD}}</div><div class="sub">{{.BlockedN}} calls refused before the provider</div></div>{{end}}
 </div>
 
 <div class="tl"><h2>Timeline</h2>
   {{range .Calls}}
-    {{if .FirstBlock}}<div class="tripped"><span class="lab">CAP TRIPPED</span><span class="txt">the gateway detected the loop and refused every call from here on</span></div>{{end}}
-    <div class="call {{if .Blocked}}blk{{else if .Loop}}flag{{end}}">
+    {{if .FirstBlock}}<div class="tripped"><span class="lab">CAP TRIPPED</span><span class="txt">the gateway detected the loop and refused the calls marked blocked below</span></div>{{end}}
+    {{if .FirstShadow}}<div class="tripped"><span class="lab">CAP WOULD HAVE TRIPPED</span><span class="txt">shadow mode: every call from here on was served, and marked</span></div>{{end}}
+    <div class="call {{if .Blocked}}blk{{else if or .Loop .Shadow}}flag{{end}}">
       <span class="node"></span>
       <span class="t">#{{.N}} · {{.Time}}</span>
       <div class="mid"><span class="m">{{if .Model}}{{.Model}}{{else}}—{{end}}</span>{{if and .Loop (not .Blocked)}}<span class="flagtag">⚠ loop {{.LoopSignal}}</span>{{end}}
-        <div class="tok">{{if .Blocked}}refused · {{.Reason}}{{else}}{{.InTok}} in · {{.OutTok}} out{{if .CacheRead}} · {{.CacheRead}} cached{{end}}{{end}}</div></div>
+        <div class="tok">{{if .Blocked}}refused · {{.Reason}}{{else}}{{.InTok}} in · {{.OutTok}} out{{if .CacheRead}} · {{.CacheRead}} cached{{end}}{{if .Shadow}} · served, a cap would have refused it: {{.WouldRefuse}}{{end}}{{end}}</div></div>
       {{if .Blocked}}<span class="amt blk">blocked</span>{{else}}<span class="amt">{{usd .CostUSD}}</span>{{end}}
     </div>
   {{end}}

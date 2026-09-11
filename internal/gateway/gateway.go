@@ -181,6 +181,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// client already sends (Claude Code, LiteLLM, W3C traceparent).
 	id := identityFromHeaders(r.Header)
 	run := id.Run
+	// The key is a fingerprint of the credential the request carries (never
+	// the credential), or the name the caller gave with X-AxiGate-Key.
+	key := keyFingerprint(g.cfg.Provider, r.Header, r.URL.Query())
+	keyName := keyName(r.Header) // a display label only; the ceiling binds to the fingerprint
+	// The row always carries the fingerprint; the counters only track a key
+	// when a key cap is set, so no store fills with keys nobody capped.
+	ctrlKey := key
+	if !g.cfg.Control.keyCaps() {
+		ctrlKey = ""
+	}
 
 	// Loop detection reads that run id; a request with no run id cannot be
 	// tied to a run, so it is never flagged.
@@ -194,12 +204,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Loop control refuses a paused or killed request before it leaves. A
-	// bypass credential forces one request through a per-run pause.
-	counter := "" // how the cap decision was made, stamped on the row: "shared" or "local" when a shared store is configured
+	// bypass credential forces one request through a per-run pause. In shadow
+	// mode the request is served either way and the row says what a cap would
+	// have done.
+	counter := ""     // how the cap decision was made, stamped on the row: "shared" or "local" when a shared store is configured
+	wouldRefuse := "" // shadow mode: the reason a cap would have refused this call
 	if g.ctrl != nil {
 		// Note who this run belongs to, so a stop alert can name the agent/team.
 		t := tagsFromHeaders(r.Header)
 		g.ctrl.noteRun(run, t.Agent, t.Team, model)
+		g.ctrl.noteKey(ctrlKey, t.Agent, t.Team, model)
 		// A caller may set its own per-run spend cap inline, from code, with no
 		// server flag or restart: X-AxiGate-Max-Spend, keyed to the run it names.
 		if g.cfg.Control.AllowRequestCaps {
@@ -208,17 +222,32 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		bypass := g.cfg.Control.AdminToken != "" && r.Header.Get("X-AxiGate-Bypass") == g.cfg.Control.AdminToken
-		ok, reason, where := g.ctrl.admitWhere(run, bypass)
+		ok, reason, where := g.ctrl.admitWhere(run, ctrlKey, bypass)
 		counter = where // the settlement goes back to the counter that decided; the row carries counterLabel(where)
 		if !ok {
 			code, typ := http.StatusTooManyRequests, "run_paused"
-			if reason == "kill switch engaged" {
+			switch {
+			case reason == "kill switch engaged":
 				code, typ = http.StatusServiceUnavailable, "killed"
+			case strings.HasPrefix(reason, "key "):
+				typ = "key_paused"
 			}
-			g.recordBlocked(r, model, run, reason, code, start, counterLabel(counter))
-			fmt.Fprintf(os.Stderr, "gateway: refused (%s) run=%q: %s\n", typ, run, reason)
+			g.recordBlocked(r, model, run, key, keyName, reason, code, start, counterLabel(counter))
+			if key != "" {
+				fmt.Fprintf(os.Stderr, "gateway: refused (%s) run=%q key=%q: %s\n", typ, run, key, reason)
+			} else {
+				fmt.Fprintf(os.Stderr, "gateway: refused (%s) run=%q: %s\n", typ, run, reason)
+			}
 			writeJSONError(w, code, typ, "axigate gateway: "+reason)
 			return
+		}
+		if reason != "" {
+			wouldRefuse = reason
+			if key != "" {
+				fmt.Fprintf(os.Stderr, "gateway: would refuse (shadow) run=%q key=%q: %s\n", run, key, reason)
+			} else {
+				fmt.Fprintf(os.Stderr, "gateway: would refuse (shadow) run=%q: %s\n", run, reason)
+			}
 		}
 	}
 
@@ -229,7 +258,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(reqBody))
 	if err != nil {
 		if g.ctrl != nil { // the call was admitted but never left; free its reservation
-			g.ctrl.release(run, counter)
+			g.ctrl.release(run, ctrlKey, counter)
 		}
 		http.Error(w, "gateway: bad request: "+err.Error(), http.StatusBadGateway)
 		return
@@ -243,7 +272,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// sees the failure. We do not record a cost for a call that never billed,
 		// so free the admit-time reservation instead.
 		if g.ctrl != nil {
-			g.ctrl.release(run, counter)
+			g.ctrl.release(run, ctrlKey, counter)
 		}
 		http.Error(w, "gateway: upstream unreachable: "+err.Error(), http.StatusBadGateway)
 		return
@@ -281,7 +310,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// From here on nothing may affect the response: it is already sent.
-	g.record(r, resp.StatusCode, streamed, model2, usage, gotUsage, start, dec, counter)
+	g.record(r, resp.StatusCode, streamed, model2, usage, gotUsage, start, dec, counter, key, keyName, wouldRefuse)
 }
 
 // parseMoney reads a dollar amount from a header like "5.00" or "$5". A
@@ -311,7 +340,7 @@ func signature(provider, model string, body []byte) string {
 
 // record builds one metadata-only event and hands it to the recorder. It never
 // returns an error: recording is best-effort by contract.
-func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model string, usage ledger.Usage, gotUsage bool, start time.Time, dec Decision, counter string) {
+func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model string, usage ledger.Usage, gotUsage bool, start time.Time, dec Decision, counter, key, keyName, wouldRefuse string) {
 	// Fail open: a misbehaving recorder must never surface on the response
 	// path, which by this point has already been fully written anyway.
 	defer func() { _ = recover() }()
@@ -338,6 +367,15 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 	identityFromHeaders(r.Header).dims(dims)
 	if l := counterLabel(counter); l != "" {
 		dims["counter"] = l
+	}
+	if key != "" {
+		dims["key"] = key
+	}
+	if keyName != "" && keyName != key {
+		dims["key_name"] = keyName
+	}
+	if wouldRefuse != "" {
+		dims["would_refuse"] = wouldRefuse // shadow mode: served, but a cap would have refused it
 	}
 
 	e := ledger.Event{
@@ -372,7 +410,7 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 	// next request is refused — and only then hand the row to the recorder,
 	// whose failure must never leave the reservation in flight.
 	if g.ctrl != nil {
-		g.ctrl.record(e.Tags.Run, e.CostUSD, dec.Suspected, counter)
+		g.ctrl.record(e.Tags.Run, g.counterKey(key), e.CostUSD, dec.Suspected, counter)
 	}
 	if g.cfg.Recorder != nil {
 		g.cfg.Recorder.Record(e)
@@ -382,7 +420,16 @@ func (g *Gateway) record(r *http.Request, statusCode int, streamed bool, model s
 // recordBlocked writes an event for a request the gateway refused, so the
 // ledger shows enforcement, not a silent gap. No provider call was made, so
 // there is no usage and no cost.
-func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code int, start time.Time, counter string) {
+// counterKey is the key the counters settle against: the fingerprint when a
+// key cap is set, nothing otherwise (see ctrlKey in ServeHTTP).
+func (g *Gateway) counterKey(key string) string {
+	if g.cfg.Control.keyCaps() {
+		return key
+	}
+	return ""
+}
+
+func (g *Gateway) recordBlocked(r *http.Request, model, run, key, keyName, reason string, code int, start time.Time, counter string) {
 	if g.cfg.Recorder == nil {
 		return
 	}
@@ -395,6 +442,12 @@ func (g *Gateway) recordBlocked(r *http.Request, model, run, reason string, code
 	identityFromHeaders(r.Header).dims(dims)
 	if counter != "" {
 		dims["counter"] = counter
+	}
+	if key != "" {
+		dims["key"] = key
+	}
+	if keyName != "" && keyName != key {
+		dims["key_name"] = keyName
 	}
 	e := ledger.Event{
 		Source: SourceGateway, Provider: g.cfg.Provider, Model: model, Dimensions: dims,

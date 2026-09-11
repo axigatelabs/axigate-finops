@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -53,15 +54,32 @@ func stopAlertErr(err error) {
 // human-readable line; the rest is machine-readable for anything custom.
 func stopAlertPayload(ev StopEvent) map[string]any {
 	who := "run " + ev.Run
-	if ev.Agent != "" {
-		who = ev.Agent + " (run " + ev.Run + ")"
+	event := "run_stopped"
+	reason := ev.Reason
+	sofar := "so far"
+	if ev.Key != "" && ev.Run == "" {
+		who = keyLabel(ev.Key)
+		event = "key_stopped"
+		// The reason already names the key ("key …7788 reached …"); say it once.
+		reason = strings.TrimPrefix(reason, who+" ")
+		if ev.dayPause {
+			sofar = "today"
+		}
 	}
-	line := fmt.Sprintf("AxiGate stopped %s — %s. %d calls, $%.2f spent so far; further calls are being refused.",
-		who, ev.Reason, ev.Calls, ev.SpendUSD)
-	return map[string]any{
+	if ev.Agent != "" {
+		who = ev.Agent + " (" + who + ")"
+	}
+	line := fmt.Sprintf("AxiGate stopped %s — %s. %d calls, $%.2f spent %s; further calls are being refused.",
+		who, reason, ev.Calls, ev.SpendUSD, sofar)
+	if ev.Shadow {
+		event = strings.TrimSuffix(event, "_stopped") + "_flagged"
+		line = fmt.Sprintf("AxiGate would have stopped %s — %s. %d calls, $%.2f spent %s; shadow mode is on, so its calls continue.",
+			who, reason, ev.Calls, ev.SpendUSD, sofar)
+	}
+	out := map[string]any{
 		"text":      line,
 		"content":   line,
-		"event":     "run_stopped",
+		"event":     event,
 		"run":       ev.Run,
 		"agent":     ev.Agent,
 		"team":      ev.Team,
@@ -71,4 +89,11 @@ func stopAlertPayload(ev StopEvent) map[string]any {
 		"spend_usd": math.Round(ev.SpendUSD*1e6) / 1e6, // no float noise for JSON consumers
 		"at":        ev.At.UTC().Format(time.RFC3339),
 	}
+	if ev.Key != "" {
+		out["key"] = ev.Key
+	}
+	if ev.Shadow {
+		out["shadow"] = true
+	}
+	return out
 }
