@@ -234,10 +234,15 @@ type Summary struct {
 	// UnmeteredUSD is what the provider's bill has that no metered call
 	// accounts for — traffic that went around the gateway, or a price the
 	// table has wrong. It is shown as one line, never spread across teams.
-	UnmeteredUSD float64    `json:"unmetered_usd"`
-	Daily        []DayPoint `json:"daily"`
-	PeakDayUSD   float64    `json:"peak_day_usd"`
-	AvoidedUSD   float64    `json:"avoided_usd"`
+	UnmeteredUSD float64 `json:"unmetered_usd"`
+	// UnknownCostCalls is how many served calls came back without usage (a
+	// stream that ended before its usage frame), so their cost is unknown and
+	// counted as nothing. They are named so a run never looks cheaper than it
+	// was; the provider's bill is what fills them in.
+	UnknownCostCalls int        `json:"unknown_cost_calls"`
+	Daily            []DayPoint `json:"daily"`
+	PeakDayUSD       float64    `json:"peak_day_usd"`
+	AvoidedUSD       float64    `json:"avoided_usd"`
 }
 
 // RunLine is one run's rollup: what it spent, how many calls that took, how
@@ -446,6 +451,12 @@ func summaryOf(sc scope, reqDays int) Summary {
 		byTeam[unmeteredKey] += unmetered
 		byAgent[unmeteredKey] += unmetered
 	}
+	unknownCost := 0
+	for _, e := range metered {
+		if e.Source == "gateway" && e.Dimensions["usage"] == "unknown" && e.Dimensions["blocked"] == "" {
+			unknownCost++
+		}
+	}
 	named := func(m map[string]float64) int {
 		n := 0
 		for k := range m {
@@ -515,7 +526,7 @@ func summaryOf(sc scope, reqDays int) Summary {
 		Events: len(evs), TotalUSD: r.TotalUSD,
 		ByProvider: linesOf(prov), ByTeam: linesOf(byTeam), ByAgent: linesOf(byAgent), ByModel: linesOf(model),
 		LoopsBlocked: blocked, BlockedRuns: runs, ByRun: byRunLines,
-		TotalState: totalState, MeteredCalls: len(metered), UnmeteredUSD: unmetered, Teams: named(byTeam), Agents: named(byAgent),
+		TotalState: totalState, MeteredCalls: len(metered), UnmeteredUSD: unmetered, UnknownCostCalls: unknownCost, Teams: named(byTeam), Agents: named(byAgent),
 		Daily: daily, PeakDayUSD: peak, AvoidedUSD: avoidedTotal,
 	}
 }

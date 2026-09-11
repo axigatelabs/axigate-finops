@@ -205,6 +205,7 @@ const dashHTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div>
 </div>
 {{if gt .Sum.UnmeteredUSD 0.0}}<p class="foot" style="margin:0 0 16px"><span class="num">(billed, not metered)</span> is {{usd .Sum.UnmeteredUSD}} on the provider's bill that nothing metered accounts for — traffic that went around the gateway, or a price in the price list that is wrong. It stays its own line; it is never spread across teams or agents.</p>{{end}}
+{{if gt .Sum.UnknownCostCalls 0}}<p class="foot" style="margin:0 0 16px"><span class="num">{{.Sum.UnknownCostCalls}}</span> served call{{if ne .Sum.UnknownCostCalls 1}}s{{end}} came back without usage (a stream that ended before its usage frame), so {{if eq .Sum.UnknownCostCalls 1}}its{{else}}their{{end}} cost is unknown and counted as nothing here — not as free. The total is that much low until the provider's bill fills it in.</p>{{end}}
 
 <div class="card runs" style="margin-bottom:16px"><h2>Spend by run <span class="ct">top {{len .Sum.ByRun}} by spend</span></h2>
   {{range .Sum.ByRun}}<div class="run-row">
